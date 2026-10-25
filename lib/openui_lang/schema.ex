@@ -538,7 +538,7 @@ defmodule OpenUILang.Schema do
     else
       items_schema = schema["items"]
 
-      if not is_map(items_schema) do
+      if not is_map(items_schema) or Map.get(items_schema, :__leaf__) == %{} do
         {{:ok, value}, ctx}
       else
         validate_array_items(value, 0, items_schema, component, path, [], ctx)

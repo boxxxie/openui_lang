@@ -505,42 +505,46 @@ defmodule OpenUILang.Materialize do
   end
 
   defp resolve_ref(name, ctx, mode) do
-    cond do
-      MapSet.member?(ctx.visited, name) ->
-        ctx = %{ctx | unres: [name | ctx.unres]}
-        {if(mode == :expr, do: %{k: :ph, n: name}, else: nil), ctx}
+    cache_key =
+      if mode == :value and is_map(Map.get(ctx, :mat_cache)) do
+        {:value, name, ctx.partial}
+      else
+        nil
+      end
 
-      not Map.has_key?(ctx.syms, name) ->
-        ctx = %{ctx | unres: [name | ctx.unres]}
-        {if(mode == :expr, do: %{k: :ph, n: name}, else: nil), ctx}
+    case cache_key && not MapSet.member?(ctx.visited, name) && Map.get(ctx.mat_cache, cache_key) do
+      %{result: cached_res, errors: cached_errs, unres: cached_unres, sub_reached: sub_reached} ->
+        unreached = MapSet.delete(ctx.unreached, name)
 
-      true ->
-        target = Map.fetch!(ctx.syms, name)
-        ctx = %{ctx | unreached: MapSet.delete(ctx.unreached, name)}
+        unreached =
+          if sub_reached == [] do
+            unreached
+          else
+            Enum.reduce(sub_reached, unreached, &MapSet.delete(&2, &1))
+          end
 
-        if target.k == :comp and Builtins.is_reserved_call?(target.name) do
-          ref_type = if target.name == "Mutation", do: :mutation, else: :query
-          {%{k: :runtime_ref, n: name, ref_type: ref_type}, ctx}
-        else
-          cache_key =
-            if mode == :value and is_map(Map.get(ctx, :mat_cache)) do
-              {:value, name, ctx.partial}
+        errors = if cached_errs == [], do: ctx.errors, else: cached_errs ++ ctx.errors
+        unres = if cached_unres == [], do: ctx.unres, else: cached_unres ++ ctx.unres
+        {cached_res, %{ctx | errors: errors, unres: unres, unreached: unreached}}
+
+      _ ->
+        cond do
+          MapSet.member?(ctx.visited, name) ->
+            ctx = %{ctx | unres: [name | ctx.unres]}
+            {if(mode == :expr, do: %{k: :ph, n: name}, else: nil), ctx}
+
+          not Map.has_key?(ctx.syms, name) ->
+            ctx = %{ctx | unres: [name | ctx.unres]}
+            {if(mode == :expr, do: %{k: :ph, n: name}, else: nil), ctx}
+
+          true ->
+            target = Map.fetch!(ctx.syms, name)
+            ctx = %{ctx | unreached: MapSet.delete(ctx.unreached, name)}
+
+            if target.k == :comp and Builtins.is_reserved_call?(target.name) do
+              ref_type = if target.name == "Mutation", do: :mutation, else: :query
+              {%{k: :runtime_ref, n: name, ref_type: ref_type}, ctx}
             else
-              nil
-            end
-
-          case cache_key && Map.get(ctx.mat_cache, cache_key) do
-            %{result: cached_res, errors: cached_errs, unres: cached_unres, reached: cached_reached} ->
-              ctx = %{
-                ctx
-                | errors: cached_errs ++ ctx.errors,
-                  unres: cached_unres ++ ctx.unres,
-                  unreached: MapSet.difference(ctx.unreached, cached_reached)
-              }
-
-              {cached_res, ctx}
-
-            nil ->
               prev_id = ctx.current_statement_id
               prev_errors = ctx.errors
               prev_unres = ctx.unres
@@ -581,18 +585,24 @@ defmodule OpenUILang.Materialize do
                 if cache_key != nil do
                   sub_errors = ctx.errors
                   sub_unres = ctx.unres
-                  reached = MapSet.difference(prev_unreached, ctx.unreached) |> MapSet.put(name)
+
+                  sub_reached =
+                    if MapSet.size(prev_unreached) == MapSet.size(ctx.unreached) do
+                      []
+                    else
+                      MapSet.difference(prev_unreached, ctx.unreached) |> MapSet.to_list()
+                    end
 
                   next_cache =
                     if sub_unres == [] and
                          (ctx[:pending_ids] == nil or
                             (not MapSet.member?(ctx.pending_ids, name) and
-                               MapSet.disjoint?(reached, ctx.pending_ids))) do
+                               not Enum.any?(sub_reached, &MapSet.member?(ctx.pending_ids, &1)))) do
                       Map.put(ctx.mat_cache, cache_key, %{
                         result: result,
                         errors: sub_errors,
                         unres: sub_unres,
-                        reached: reached
+                        sub_reached: sub_reached
                       })
                     else
                       ctx.mat_cache
@@ -615,7 +625,7 @@ defmodule OpenUILang.Materialize do
                 end
 
               {result, ctx}
-          end
+            end
         end
     end
   end
