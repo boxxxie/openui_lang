@@ -104,23 +104,29 @@ defmodule OpenUILang.Lexer do
   end
 
   # State variable: $identifier
-  defp do_tokenize(<<"$", c, rest::binary>>, acc)
+  defp do_tokenize(<<"$", c, rest::binary>> = bin, acc)
        when c in ?a..?z or c in ?A..?Z or c == ?_ do
-    {ident, remaining} = take_ident(rest, <<"$", c>>)
+    len = count_ident_bytes(rest, 2)
+    ident = :binary.copy(binary_part(bin, 0, len))
+    remaining = binary_part(bin, len, byte_size(bin) - len)
     do_tokenize(remaining, [%{t: :state_var, v: ident} | acc])
   end
 
   # Builtin / function / action call: @identifier
-  defp do_tokenize(<<"@", c, rest::binary>>, acc)
+  defp do_tokenize(<<"@", c, rest::binary>> = bin, acc)
        when c in ?a..?z or c in ?A..?Z or c == ?_ do
-    {ident, remaining} = take_ident(rest, <<c>>)
+    len = count_ident_bytes(rest, 1)
+    ident = :binary.copy(binary_part(bin, 1, len))
+    remaining = binary_part(bin, len + 1, byte_size(bin) - len - 1)
     do_tokenize(remaining, [%{t: :builtin_call, v: ident} | acc])
   end
 
   # Identifiers & keywords
-  defp do_tokenize(<<c, rest::binary>>, acc)
+  defp do_tokenize(<<c, rest::binary>> = bin, acc)
        when c in ?a..?z or c in ?A..?Z or c == ?_ do
-    {word, remaining} = take_ident(rest, <<c>>)
+    len = count_ident_bytes(rest, 1)
+    word = :binary.copy(binary_part(bin, 0, len))
+    remaining = binary_part(bin, len, byte_size(bin) - len)
 
     tok =
       case word do
@@ -144,6 +150,10 @@ defmodule OpenUILang.Lexer do
   end
 
   # ── String scanners ──────────────────────────────────────────────────────
+
+  defp scan_double_quoted(bin, []) do
+    scan_double_fast(bin, bin, 0)
+  end
 
   defp scan_double_quoted(<<>>, acc),
     do: {:binary.copy(IO.iodata_to_binary(Enum.reverse(acc))), <<>>}
@@ -185,12 +195,44 @@ defmodule OpenUILang.Lexer do
     {IO.iodata_to_binary(Enum.reverse(["\\" | acc])), <<>>}
   end
 
-  defp scan_double_quoted(<<c::utf8, rest::binary>>, acc) do
-    scan_double_quoted(rest, [<<c::utf8>> | acc])
+  defp scan_double_quoted(bin, acc) do
+    case count_plain_double(bin, 0) do
+      0 ->
+        <<c, rest::binary>> = bin
+        scan_double_quoted(rest, [<<c>> | acc])
+
+      n ->
+        chunk = binary_part(bin, 0, n)
+        rest = binary_part(bin, n, byte_size(bin) - n)
+        scan_double_quoted(rest, [chunk | acc])
+    end
   end
 
-  defp scan_double_quoted(<<c, rest::binary>>, acc) do
-    scan_double_quoted(rest, [<<c>> | acc])
+  defp scan_double_fast(orig, <<"\"", rest::binary>>, len) do
+    {:binary.copy(binary_part(orig, 0, len)), rest}
+  end
+
+  defp scan_double_fast(orig, <<>>, len) do
+    {:binary.copy(binary_part(orig, 0, len)), <<>>}
+  end
+
+  defp scan_double_fast(orig, <<"\\", _::binary>> = rest, len) do
+    prefix = if len > 0, do: [binary_part(orig, 0, len)], else: []
+    scan_double_quoted(rest, prefix)
+  end
+
+  defp scan_double_fast(orig, <<_c, rest::binary>>, len) do
+    scan_double_fast(orig, rest, len + 1)
+  end
+
+  defp count_plain_double(<<c, rest::binary>>, n) when c != ?" and c != ?\\ do
+    count_plain_double(rest, n + 1)
+  end
+
+  defp count_plain_double(_, n), do: n
+
+  defp scan_single_quoted(bin, []) do
+    scan_single_fast(bin, bin, 0)
   end
 
   defp scan_single_quoted(<<>>, acc),
@@ -222,6 +264,23 @@ defmodule OpenUILang.Lexer do
 
   defp scan_single_quoted(<<c, rest::binary>>, acc) do
     scan_single_quoted(rest, [<<c>> | acc])
+  end
+
+  defp scan_single_fast(orig, <<"'", rest::binary>>, len) do
+    {:binary.copy(binary_part(orig, 0, len)), rest}
+  end
+
+  defp scan_single_fast(orig, <<>>, len) do
+    {:binary.copy(binary_part(orig, 0, len)), <<>>}
+  end
+
+  defp scan_single_fast(orig, <<"\\", _::binary>> = rest, len) do
+    prefix = if len > 0, do: [binary_part(orig, 0, len)], else: []
+    scan_single_quoted(rest, prefix)
+  end
+
+  defp scan_single_fast(orig, <<_c, rest::binary>>, len) do
+    scan_single_fast(orig, rest, len + 1)
   end
 
   # ── Number scanner ───────────────────────────────────────────────────────
@@ -307,16 +366,23 @@ defmodule OpenUILang.Lexer do
 
   def normalize_number(n), do: n
 
-  defp take_digits(<<c, rest::binary>>, acc) when c in ?0..?9 do
-    take_digits(rest, acc <> <<c>>)
+  defp take_digits(bin, prefix) do
+    len = count_digit_bytes(bin, 0)
+    digits = binary_part(bin, 0, len)
+    rest = binary_part(bin, len, byte_size(bin) - len)
+    {if(prefix == "", do: digits, else: prefix <> digits), rest}
   end
 
-  defp take_digits(rest, acc), do: {acc, rest}
+  defp count_digit_bytes(<<c, rest::binary>>, n) when c in ?0..?9 do
+    count_digit_bytes(rest, n + 1)
+  end
 
-  defp take_ident(<<c, rest::binary>>, acc)
+  defp count_digit_bytes(_, n), do: n
+
+  defp count_ident_bytes(<<c, rest::binary>>, n)
        when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_ do
-    take_ident(rest, acc <> <<c>>)
+    count_ident_bytes(rest, n + 1)
   end
 
-  defp take_ident(rest, acc), do: {:binary.copy(acc), rest}
+  defp count_ident_bytes(_, n), do: n
 end

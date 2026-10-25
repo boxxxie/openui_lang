@@ -17,7 +17,7 @@ defmodule OpenUILang.Materialize do
         true
 
       AST.is_element_node?(v) ->
-        v.props |> Map.values() |> Enum.any?(&contains_dynamic_value?/1)
+        Map.get(v, :has_dynamic_props, false)
 
       is_list(Map.get(v, :steps)) or is_list(Map.get(v, "steps")) ->
         true
@@ -466,9 +466,11 @@ defmodule OpenUILang.Materialize do
       Enum.reduce(missing_required, {props, []}, fn p, {acc_props, inv_list} ->
         case p.default_value do
           {:ok, def_val} -> {Map.put(acc_props, p.name, def_val), inv_list}
-          :undefined -> {acc_props, inv_list ++ [p]}
+          :undefined -> {acc_props, [p | inv_list]}
         end
       end)
+
+    still_invalid = Enum.reverse(still_invalid)
 
     cond do
       still_invalid != [] ->
@@ -505,11 +507,11 @@ defmodule OpenUILang.Materialize do
   defp resolve_ref(name, ctx, mode) do
     cond do
       MapSet.member?(ctx.visited, name) ->
-        ctx = %{ctx | unres: ctx.unres ++ [name]}
+        ctx = %{ctx | unres: [name | ctx.unres]}
         {if(mode == :expr, do: %{k: :ph, n: name}, else: nil), ctx}
 
       not Map.has_key?(ctx.syms, name) ->
-        ctx = %{ctx | unres: ctx.unres ++ [name]}
+        ctx = %{ctx | unres: [name | ctx.unres]}
         {if(mode == :expr, do: %{k: :ph, n: name}, else: nil), ctx}
 
       true ->

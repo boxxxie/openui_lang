@@ -47,68 +47,76 @@ defmodule OpenUILang.Statements do
 
   @spec strip_fences(String.t()) :: String.t()
   def strip_fences(input) when is_binary(input) do
-    blocks = extract_fence_blocks(input, [])
+    if :binary.match(input, "```") == :nomatch do
+      input
+    else
+      blocks = extract_fence_blocks(input, [])
 
-    cond do
-      blocks != [] ->
-        Enum.join(blocks, "\n")
+      cond do
+        blocks != [] ->
+          Enum.join(blocks, "\n")
 
-      String.starts_with?(input, "```") ->
-        rest = binary_part(input, 3, byte_size(input) - 3)
+        String.starts_with?(input, "```") ->
+          rest = binary_part(input, 3, byte_size(input) - 3)
 
-        body =
-          case :binary.match(rest, "\n") do
-            {pos, 1} -> binary_part(rest, pos + 1, byte_size(rest) - pos - 1)
-            :nomatch -> rest
+          body =
+            case :binary.match(rest, "\n") do
+              {pos, 1} -> binary_part(rest, pos + 1, byte_size(rest) - pos - 1)
+              :nomatch -> rest
+            end
+
+          case :binary.matches(body, "```") do
+            [] ->
+              body
+
+            matches ->
+              {last_pos, _} = List.last(matches)
+              binary_part(body, 0, last_pos)
           end
 
-        case :binary.matches(body, "```") do
-          [] ->
-            body
-
-          matches ->
-            {last_pos, _} = List.last(matches)
-            binary_part(body, 0, last_pos)
-        end
-
-      true ->
-        input
+        true ->
+          input
+      end
     end
   end
 
   defp extract_fence_blocks(<<>>, acc), do: Enum.reverse(acc)
 
   defp extract_fence_blocks(input, acc) do
-    case find_fence(input, 0, byte_size(input)) do
-      :none ->
-        Enum.reverse(acc)
+    if :binary.match(input, "```") == :nomatch do
+      Enum.reverse(acc)
+    else
+      case find_fence(input, 0, byte_size(input)) do
+        :none ->
+          Enum.reverse(acc)
 
-      {:ok, fence_start} ->
-        after_open = fence_start + 3
-        len = byte_size(input)
+        {:ok, fence_start} ->
+          after_open = fence_start + 3
+          len = byte_size(input)
 
-        case find_newline(input, after_open, len) do
-          :none ->
-            # Streaming: no newline after opening fence yet
-            tail = binary_part(input, after_open, len - after_open)
-            cleaned = Regex.replace(~r/^[^\n]*\n?/, tail, "")
-            Enum.reverse([cleaned | acc])
+          case find_newline(input, after_open, len) do
+            :none ->
+              # Streaming: no newline after opening fence yet
+              tail = binary_part(input, after_open, len - after_open)
+              cleaned = Regex.replace(~r/^[^\n]*\n?/, tail, "")
+              Enum.reverse([cleaned | acc])
 
-          {:ok, nl_pos} ->
-            body_start = nl_pos + 1
+            {:ok, nl_pos} ->
+              body_start = nl_pos + 1
 
-            case find_fence(input, body_start, len) do
-              :none ->
-                block = binary_part(input, body_start, len - body_start)
-                Enum.reverse([block | acc])
+              case find_fence(input, body_start, len) do
+                :none ->
+                  block = binary_part(input, body_start, len - body_start)
+                  Enum.reverse([block | acc])
 
-              {:ok, close_pos} ->
-                block = binary_part(input, body_start, close_pos - body_start)
-                rest_start = close_pos + 3
-                rest = binary_part(input, rest_start, len - rest_start)
-                extract_fence_blocks(rest, [block | acc])
-            end
-        end
+                {:ok, close_pos} ->
+                  block = binary_part(input, body_start, close_pos - body_start)
+                  rest_start = close_pos + 3
+                  rest = binary_part(input, rest_start, len - rest_start)
+                  extract_fence_blocks(rest, [block | acc])
+              end
+          end
+      end
     end
   end
 
@@ -154,51 +162,54 @@ defmodule OpenUILang.Statements do
 
   @spec strip_comments(String.t()) :: String.t()
   def strip_comments(input) when is_binary(input) do
-    lines = String.split(input, "\n")
+    if :binary.match(input, ["//", "#"]) == :nomatch do
+      input
+    else
+      lines = String.split(input, "\n")
 
-    {out_lines, _in_str} =
-      Enum.map_reduce(lines, false, fn line, in_str ->
-        strip_line_comment(line, 0, byte_size(line), in_str)
-      end)
+      {out_lines, _in_str} =
+        Enum.map_reduce(lines, false, fn line, in_str ->
+          if in_str == false and :binary.match(line, ["//", "#", "\"", "'"]) == :nomatch do
+            {line, false}
+          else
+            strip_line_comment(line, line, 0, in_str)
+          end
+        end)
 
-    Enum.join(out_lines, "\n")
-  end
-
-  defp strip_line_comment(line, i, len, in_str) when i >= len do
-    {line, in_str}
-  end
-
-  defp strip_line_comment(line, i, len, in_str) when in_str != false do
-    c = :binary.at(line, i)
-
-    cond do
-      c == ?\\ and i + 1 < len ->
-        strip_line_comment(line, i + 2, len, in_str)
-
-      c == in_str ->
-        strip_line_comment(line, i + 1, len, false)
-
-      true ->
-        strip_line_comment(line, i + 1, len, in_str)
+      Enum.join(out_lines, "\n")
     end
   end
 
-  defp strip_line_comment(line, i, len, false) do
-    c = :binary.at(line, i)
+  defp strip_line_comment(orig, <<>>, _i, in_str) do
+    {orig, in_str}
+  end
 
-    cond do
-      c in [?", ?'] ->
-        strip_line_comment(line, i + 1, len, c)
+  defp strip_line_comment(orig, <<"\\", _esc, rest::binary>>, i, in_str) when in_str != false do
+    strip_line_comment(orig, rest, i + 2, in_str)
+  end
 
-      c == ?/ and i + 1 < len and :binary.at(line, i + 1) == ?/ ->
-        {line |> binary_part(0, i) |> String.trim_trailing(), false}
-
-      c == ?# ->
-        {line |> binary_part(0, i) |> String.trim_trailing(), false}
-
-      true ->
-        strip_line_comment(line, i + 1, len, false)
+  defp strip_line_comment(orig, <<c, rest::binary>>, i, in_str) when in_str != false do
+    if c == in_str do
+      strip_line_comment(orig, rest, i + 1, false)
+    else
+      strip_line_comment(orig, rest, i + 1, in_str)
     end
+  end
+
+  defp strip_line_comment(orig, <<c, rest::binary>>, i, false) when c in [?", ?'] do
+    strip_line_comment(orig, rest, i + 1, c)
+  end
+
+  defp strip_line_comment(orig, <<"//", _rest::binary>>, i, false) do
+    {orig |> binary_part(0, i) |> String.trim_trailing(), false}
+  end
+
+  defp strip_line_comment(orig, <<"#", _rest::binary>>, i, false) do
+    {orig |> binary_part(0, i) |> String.trim_trailing(), false}
+  end
+
+  defp strip_line_comment(orig, <<_c, rest::binary>>, i, false) do
+    strip_line_comment(orig, rest, i + 1, false)
   end
 
   @spec auto_close(String.t()) :: %{text: String.t(), was_incomplete: boolean()}

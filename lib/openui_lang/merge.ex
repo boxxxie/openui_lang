@@ -17,10 +17,13 @@ defmodule OpenUILang.Merge do
         existing
 
       true ->
-        {merged, asts, order} =
+        {merged, asts, rev_order} =
           Enum.reduce(existing_stmts, {%{}, %{}, []}, fn stmt, {m, a, o} ->
-            {Map.put(m, stmt.id, stmt.raw), Map.put(a, stmt.id, stmt.ast), o ++ [stmt.id]}
+            o = if Map.has_key?(m, stmt.id), do: o, else: [stmt.id | o]
+            {Map.put(m, stmt.id, stmt.raw), Map.put(a, stmt.id, stmt.ast), o}
           end)
+
+        order = Enum.reverse(rev_order)
 
         {merged, asts, order} =
           Enum.reduce(patch_stmts, {merged, asts, order}, fn stmt, {m, a, o} ->
@@ -63,55 +66,50 @@ defmodule OpenUILang.Merge do
   end
 
   defp split_statement_source(input) do
-    do_split_source(input, 0, byte_size(input), 0, 0, false, false, [])
+    do_split_source(input, input, 0, 0, 0, false, [])
   end
 
-  defp do_split_source(input, i, len, start, _depth, _in_str, _esc, acc) when i >= len do
-    tail = binary_part(input, start, len - start) |> String.trim()
+  defp do_split_source(orig, <<>>, i, start, _depth, _in_str, acc) do
+    tail = binary_part(orig, start, i - start) |> String.trim()
     acc = if tail != "", do: [tail | acc], else: acc
     Enum.reverse(acc)
   end
 
-  defp do_split_source(input, i, len, start, depth, in_str, true, acc) do
-    do_split_source(input, i + 1, len, start, depth, in_str, false, acc)
+  defp do_split_source(orig, <<"\\", _esc, rest::binary>>, i, start, depth, in_str, acc)
+       when in_str != false do
+    do_split_source(orig, rest, i + 2, start, depth, in_str, acc)
   end
 
-  defp do_split_source(input, i, len, start, depth, in_str, false, acc) when in_str != false do
-    c = :binary.at(input, i)
-
-    cond do
-      c == ?\\ ->
-        do_split_source(input, i + 1, len, start, depth, in_str, true, acc)
-
-      c == in_str ->
-        do_split_source(input, i + 1, len, start, depth, false, false, acc)
-
-      true ->
-        do_split_source(input, i + 1, len, start, depth, in_str, false, acc)
-    end
+  defp do_split_source(orig, <<c, rest::binary>>, i, start, depth, in_str, acc)
+       when in_str != false do
+    next_str = if c == in_str, do: false, else: in_str
+    do_split_source(orig, rest, i + 1, start, depth, next_str, acc)
   end
 
-  defp do_split_source(input, i, len, start, depth, false, false, acc) do
-    c = :binary.at(input, i)
+  defp do_split_source(orig, <<c, rest::binary>>, i, start, depth, false, acc)
+       when c in [?", ?'] do
+    do_split_source(orig, rest, i + 1, start, depth, c, acc)
+  end
 
-    cond do
-      c in [?", ?'] ->
-        do_split_source(input, i + 1, len, start, depth, c, false, acc)
+  defp do_split_source(orig, <<c, rest::binary>>, i, start, depth, false, acc)
+       when c in [?(, ?[, ?{] do
+    do_split_source(orig, rest, i + 1, start, depth + 1, false, acc)
+  end
 
-      c in [?(, ?[, ?{] ->
-        do_split_source(input, i + 1, len, start, depth + 1, false, false, acc)
+  defp do_split_source(orig, <<c, rest::binary>>, i, start, depth, false, acc)
+       when c in [?), ?], ?}] do
+    do_split_source(orig, rest, i + 1, start, max(0, depth - 1), false, acc)
+  end
 
-      c in [?), ?], ?}] ->
-        do_split_source(input, i + 1, len, start, max(0, depth - 1), false, false, acc)
+  defp do_split_source(orig, <<"\n", rest::binary>>, i, start, depth, false, acc)
+       when depth <= 0 do
+    stmt = binary_part(orig, start, i - start) |> String.trim()
+    acc = if stmt != "", do: [stmt | acc], else: acc
+    do_split_source(orig, rest, i + 1, i + 1, depth, false, acc)
+  end
 
-      c == ?\n and depth <= 0 ->
-        stmt = binary_part(input, start, i - start) |> String.trim()
-        acc = if stmt != "", do: [stmt | acc], else: acc
-        do_split_source(input, i + 1, len, i + 1, depth, false, false, acc)
-
-      true ->
-        do_split_source(input, i + 1, len, start, depth, false, false, acc)
-    end
+  defp do_split_source(orig, <<_c, rest::binary>>, i, start, depth, false, acc) do
+    do_split_source(orig, rest, i + 1, start, depth, false, acc)
   end
 
   defp gc_unreachable(order, merged, asts, root_id) do
@@ -146,34 +144,18 @@ defmodule OpenUILang.Merge do
         bfs_reachable(rest, reachable, asts)
 
       ast ->
-        refs = collect_refs(ast)
+        refs = AST.collect_refs(ast)
 
-        {new_queue, new_reachable} =
-          Enum.reduce(refs, {rest, reachable}, fn ref, {q, r} ->
+        {new_refs, new_reachable} =
+          Enum.reduce(refs, {[], reachable}, fn ref, {acc_q, r} ->
             if not MapSet.member?(r, ref) and Map.has_key?(asts, ref) do
-              {q ++ [ref], MapSet.put(r, ref)}
+              {[ref | acc_q], MapSet.put(r, ref)}
             else
-              {q, r}
+              {acc_q, r}
             end
           end)
 
-        bfs_reachable(new_queue, new_reachable, asts)
-    end
-  end
-
-  defp collect_refs(node) do
-    refs_table = :ets.new(:refs, [:set, :private])
-
-    try do
-      AST.walk_ast(node, fn
-        %{k: :ref, n: n} -> :ets.insert(refs_table, {n, true})
-        %{k: :runtime_ref, n: n} -> :ets.insert(refs_table, {n, true})
-        _ -> :ok
-      end)
-
-      :ets.tab2list(refs_table) |> Enum.map(&elem(&1, 0))
-    after
-      :ets.delete(refs_table)
+        bfs_reachable(Enum.reverse(new_refs, rest), new_reachable, asts)
     end
   end
 end

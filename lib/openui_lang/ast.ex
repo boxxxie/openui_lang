@@ -104,6 +104,113 @@ defmodule OpenUILang.AST do
     end
   end
 
+  @spec collect_refs(term()) :: [String.t()]
+  def collect_refs(node) do
+    if is_ast_node?(node) do
+      collect_refs_rec(node, [])
+      |> Enum.reverse()
+      |> Enum.uniq()
+    else
+      []
+    end
+  end
+
+  defp collect_refs_rec(%{k: k, n: n}, acc) when k in [:ref, :runtime_ref], do: [n | acc]
+
+  defp collect_refs_rec(%{k: :comp, args: args} = comp, acc) do
+    acc = Enum.reduce(args, acc, &collect_refs_rec/2)
+
+    if mapped = Map.get(comp, :mapped_props) do
+      Enum.reduce(Map.values(mapped), acc, &collect_refs_rec/2)
+    else
+      acc
+    end
+  end
+
+  defp collect_refs_rec(%{k: :arr, els: els}, acc) do
+    Enum.reduce(els, acc, &collect_refs_rec/2)
+  end
+
+  defp collect_refs_rec(%{k: :obj, entries: entries}, acc) do
+    Enum.reduce(entries, acc, fn {_k, v}, a -> collect_refs_rec(v, a) end)
+  end
+
+  defp collect_refs_rec(%{k: :bin_op, left: l, right: r}, acc) do
+    acc = collect_refs_rec(l, acc)
+    collect_refs_rec(r, acc)
+  end
+
+  defp collect_refs_rec(%{k: :unary_op, operand: op}, acc) do
+    collect_refs_rec(op, acc)
+  end
+
+  defp collect_refs_rec(%{k: :ternary, cond: c, then: t, else: e}, acc) do
+    acc
+    |> then(&collect_refs_rec(c, &1))
+    |> then(&collect_refs_rec(t, &1))
+    |> then(&collect_refs_rec(e, &1))
+  end
+
+  defp collect_refs_rec(%{k: :member, obj: obj}, acc) do
+    collect_refs_rec(obj, acc)
+  end
+
+  defp collect_refs_rec(%{k: :index, obj: obj, index: idx}, acc) do
+    acc = collect_refs_rec(obj, acc)
+    collect_refs_rec(idx, acc)
+  end
+
+  defp collect_refs_rec(%{k: :assign, value: val}, acc) do
+    collect_refs_rec(val, acc)
+  end
+
+  defp collect_refs_rec(_, acc), do: acc
+
+  @spec any_ast?(term(), (map() -> boolean())) :: boolean()
+  def any_ast?(node, pred) when is_map(node) and is_function(pred, 1) do
+    if pred.(node) do
+      true
+    else
+      case node do
+        %{k: :comp, args: args} = comp ->
+          Enum.any?(args, &any_ast?(&1, pred)) or
+            case Map.get(comp, :mapped_props) do
+              nil -> false
+              mapped -> mapped |> Map.values() |> Enum.any?(&any_ast?(&1, pred))
+            end
+
+        %{k: :arr, els: els} ->
+          Enum.any?(els, &any_ast?(&1, pred))
+
+        %{k: :obj, entries: entries} ->
+          Enum.any?(entries, fn {_k, v} -> any_ast?(v, pred) end)
+
+        %{k: :bin_op, left: left, right: right} ->
+          any_ast?(left, pred) or any_ast?(right, pred)
+
+        %{k: :unary_op, operand: operand} ->
+          any_ast?(operand, pred)
+
+        %{k: :ternary, cond: cond_node, then: then_node, else: else_node} ->
+          any_ast?(cond_node, pred) or any_ast?(then_node, pred) or any_ast?(else_node, pred)
+
+        %{k: :member, obj: obj} ->
+          any_ast?(obj, pred)
+
+        %{k: :index, obj: obj, index: index} ->
+          any_ast?(obj, pred) or any_ast?(index, pred)
+
+        %{k: :assign, value: value} ->
+          any_ast?(value, pred)
+
+        _ ->
+          false
+      end
+    end
+  end
+
+  def any_ast?(_, _), do: false
+
   defp collect_state_refs_rec(%{k: :state_ref, n: n}, acc), do: [n | acc]
 
   defp collect_state_refs_rec(%{k: :comp, args: args} = comp, acc) do

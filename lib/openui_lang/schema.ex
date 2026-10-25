@@ -276,7 +276,7 @@ defmodule OpenUILang.Schema do
         err
       end
 
-    %{ctx | errors: ctx.errors ++ [err]}
+    %{ctx | errors: [err | ctx.errors]}
   end
 
   defp validation_message(_component, path, %{code: "type-mismatch"} = issue) do

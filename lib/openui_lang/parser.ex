@@ -49,14 +49,15 @@ defmodule OpenUILang.Parser do
       if stmts == [] do
         empty_result(was_incomplete)
       else
-        {stmt_map, stmt_order} =
+        {stmt_map, rev_order} =
           Enum.reduce(stmts, {%{}, []}, fn s, {acc_map, acc_order} ->
             expr = Expressions.parse_expression(s.tokens)
             stmt = classify_statement(s, expr)
-            acc_order = if Map.has_key?(acc_map, s.id), do: acc_order, else: acc_order ++ [s.id]
+            acc_order = if Map.has_key?(acc_map, s.id), do: acc_order, else: [s.id | acc_order]
             {Map.put(acc_map, s.id, stmt), acc_order}
           end)
 
+        stmt_order = Enum.reverse(rev_order)
         typed_stmts = Enum.map(stmt_order, &Map.fetch!(stmt_map, &1))
 
         build_result(
@@ -228,7 +229,7 @@ defmodule OpenUILang.Parser do
           if Map.has_key?(acc_sp.completed_stmt_map, s.id) do
             acc_sp.completed_stmt_order
           else
-            acc_sp.completed_stmt_order ++ [s.id]
+            [s.id | acc_sp.completed_stmt_order]
           end
 
         %{
@@ -242,102 +243,77 @@ defmodule OpenUILang.Parser do
   end
 
   defp scan_new_completed(%__MODULE__{} = sp) do
-    do_scan_completed(
-      sp.cleaned,
-      sp.completed_end,
-      byte_size(sp.cleaned),
-      sp.completed_end,
-      0,
-      0,
-      false,
-      false,
-      sp
-    )
+    len = byte_size(sp.cleaned)
+    start = sp.completed_end
+    rest = binary_part(sp.cleaned, start, len - start)
+    do_scan_completed(sp.cleaned, rest, start, start, 0, 0, false, sp)
   end
 
-  defp do_scan_completed(_cleaned, i, len, stmt_start, _depth, _tdepth, _in_str, _esc, sp)
-       when i >= len do
+  defp do_scan_completed(_cleaned, <<>>, _i, stmt_start, _depth, _tdepth, _in_str, sp) do
     {stmt_start, sp}
   end
 
-  defp do_scan_completed(cleaned, i, len, stmt_start, depth, tdepth, in_str, true, sp) do
-    do_scan_completed(cleaned, i + 1, len, stmt_start, depth, tdepth, in_str, false, sp)
-  end
-
-  defp do_scan_completed(cleaned, i, len, stmt_start, depth, tdepth, in_str, false, sp)
+  defp do_scan_completed(cleaned, <<"\\", _esc, rest::binary>>, i, stmt_start, depth, tdepth, in_str, sp)
        when in_str != false do
-    c = :binary.at(cleaned, i)
-
-    cond do
-      c == ?\\ ->
-        do_scan_completed(cleaned, i + 1, len, stmt_start, depth, tdepth, in_str, true, sp)
-
-      c == in_str ->
-        do_scan_completed(cleaned, i + 1, len, stmt_start, depth, tdepth, false, false, sp)
-
-      true ->
-        do_scan_completed(cleaned, i + 1, len, stmt_start, depth, tdepth, in_str, false, sp)
-    end
+    do_scan_completed(cleaned, rest, i + 2, stmt_start, depth, tdepth, in_str, sp)
   end
 
-  defp do_scan_completed(cleaned, i, len, stmt_start, depth, tdepth, false, false, sp) do
-    c = :binary.at(cleaned, i)
-
-    cond do
-      c in [?", ?'] ->
-        do_scan_completed(cleaned, i + 1, len, stmt_start, depth, tdepth, c, false, sp)
-
-      c in [?(, ?[, ?{] ->
-        do_scan_completed(cleaned, i + 1, len, stmt_start, depth + 1, tdepth, false, false, sp)
-
-      c in [?), ?], ?}] ->
-        do_scan_completed(
-          cleaned,
-          i + 1,
-          len,
-          stmt_start,
-          max(0, depth - 1),
-          tdepth,
-          false,
-          false,
-          sp
-        )
-
-      c == ?? and depth == 0 ->
-        do_scan_completed(cleaned, i + 1, len, stmt_start, depth, tdepth + 1, false, false, sp)
-
-      c == ?: and depth == 0 and tdepth > 0 ->
-        do_scan_completed(cleaned, i + 1, len, stmt_start, depth, tdepth - 1, false, false, sp)
-
-      c == ?\n and depth <= 0 and tdepth <= 0 ->
-        peek_char = peek_next_non_ws_char(cleaned, i + 1, len)
-
-        if peek_char == ?? or (peek_char == ?: and tdepth > 0) do
-          do_scan_completed(cleaned, i + 1, len, stmt_start, depth, tdepth, false, false, sp)
-        else
-          slice = binary_part(cleaned, stmt_start, i - stmt_start) |> String.trim()
-          sp = if slice != "", do: add_completed_stmt(sp, slice), else: sp
-          next_start = i + 1
-          sp = %{sp | completed_end: next_start}
-          do_scan_completed(cleaned, i + 1, len, next_start, depth, tdepth, false, false, sp)
-        end
-
-      true ->
-        do_scan_completed(cleaned, i + 1, len, stmt_start, depth, tdepth, false, false, sp)
-    end
+  defp do_scan_completed(cleaned, <<c, rest::binary>>, i, stmt_start, depth, tdepth, in_str, sp)
+       when in_str != false do
+    next_str = if c == in_str, do: false, else: in_str
+    do_scan_completed(cleaned, rest, i + 1, stmt_start, depth, tdepth, next_str, sp)
   end
 
-  defp peek_next_non_ws_char(_cleaned, i, len) when i >= len, do: nil
+  defp do_scan_completed(cleaned, <<c, rest::binary>>, i, stmt_start, depth, tdepth, false, sp)
+       when c in [?", ?'] do
+    do_scan_completed(cleaned, rest, i + 1, stmt_start, depth, tdepth, c, sp)
+  end
 
-  defp peek_next_non_ws_char(cleaned, i, len) do
-    c = :binary.at(cleaned, i)
+  defp do_scan_completed(cleaned, <<c, rest::binary>>, i, stmt_start, depth, tdepth, false, sp)
+       when c in [?(, ?[, ?{] do
+    do_scan_completed(cleaned, rest, i + 1, stmt_start, depth + 1, tdepth, false, sp)
+  end
 
-    if c in [?\s, ?\t, ?\r, ?\n] do
-      peek_next_non_ws_char(cleaned, i + 1, len)
+  defp do_scan_completed(cleaned, <<c, rest::binary>>, i, stmt_start, depth, tdepth, false, sp)
+       when c in [?), ?], ?}] do
+    do_scan_completed(cleaned, rest, i + 1, stmt_start, max(0, depth - 1), tdepth, false, sp)
+  end
+
+  defp do_scan_completed(cleaned, <<??, rest::binary>>, i, stmt_start, 0, tdepth, false, sp) do
+    do_scan_completed(cleaned, rest, i + 1, stmt_start, 0, tdepth + 1, false, sp)
+  end
+
+  defp do_scan_completed(cleaned, <<?:, rest::binary>>, i, stmt_start, 0, tdepth, false, sp)
+       when tdepth > 0 do
+    do_scan_completed(cleaned, rest, i + 1, stmt_start, 0, tdepth - 1, false, sp)
+  end
+
+  defp do_scan_completed(cleaned, <<"\n", rest::binary>>, i, stmt_start, depth, tdepth, false, sp)
+       when depth <= 0 and tdepth <= 0 do
+    peek_char = peek_next_non_ws_char(rest)
+
+    if peek_char == ?? or (peek_char == ?: and tdepth > 0) do
+      do_scan_completed(cleaned, rest, i + 1, stmt_start, depth, tdepth, false, sp)
     else
-      c
+      slice = binary_part(cleaned, stmt_start, i - stmt_start) |> String.trim()
+      sp = if slice != "", do: add_completed_stmt(sp, slice), else: sp
+      next_start = i + 1
+      sp = %{sp | completed_end: next_start}
+      do_scan_completed(cleaned, rest, next_start, next_start, depth, tdepth, false, sp)
     end
   end
+
+  defp do_scan_completed(cleaned, <<_c, rest::binary>>, i, stmt_start, depth, tdepth, false, sp) do
+    do_scan_completed(cleaned, rest, i + 1, stmt_start, depth, tdepth, false, sp)
+  end
+
+  defp peek_next_non_ws_char(<<>>), do: nil
+
+  defp peek_next_non_ws_char(<<c, rest::binary>>) when c in [?\s, ?\t, ?\r, ?\n] do
+    peek_next_non_ws_char(rest)
+  end
+
+  defp peek_next_non_ws_char(<<c, _::binary>>), do: c
 
   defp current_result(%__MODULE__{} = sp, complete) do
     sp = refresh_cleaned(sp)
@@ -350,7 +326,9 @@ defmodule OpenUILang.Parser do
         {empty_result(), sp}
       else
         typed_stmts =
-          Enum.map(sp.completed_stmt_order, &Map.fetch!(sp.completed_stmt_map, &1))
+          sp.completed_stmt_order
+          |> Enum.reverse()
+          |> Enum.map(&Map.fetch!(sp.completed_stmt_map, &1))
 
         res =
           build_result(
@@ -374,7 +352,9 @@ defmodule OpenUILang.Parser do
           {empty_result(was_incomplete), sp}
         else
           typed_stmts =
-            Enum.map(sp.completed_stmt_order, &Map.fetch!(sp.completed_stmt_map, &1))
+            sp.completed_stmt_order
+            |> Enum.reverse()
+            |> Enum.map(&Map.fetch!(sp.completed_stmt_map, &1))
 
           res =
             build_result(
@@ -390,7 +370,7 @@ defmodule OpenUILang.Parser do
           {res, sp}
         end
       else
-        {all_map, all_order, pending_ids} =
+        {all_map, rev_all_order, pending_ids} =
           Enum.reduce(
             stmts,
             {sp.completed_stmt_map, sp.completed_stmt_order, MapSet.new()},
@@ -402,7 +382,7 @@ defmodule OpenUILang.Parser do
                 stmt = classify_statement(s, expr)
 
                 acc_order =
-                  if Map.has_key?(acc_map, s.id), do: acc_order, else: acc_order ++ [s.id]
+                  if Map.has_key?(acc_map, s.id), do: acc_order, else: [s.id | acc_order]
 
                 {Map.put(acc_map, s.id, stmt), acc_order, MapSet.put(acc_pending, s.id)}
               end
@@ -411,7 +391,11 @@ defmodule OpenUILang.Parser do
 
         tail_name = detect_partial_state_tail(sp.buf, pending_text, complete)
         partial_ref = if tail_name, do: %{name: tail_name, stmt_ids: pending_ids}, else: nil
-        all_typed_stmts = Enum.map(all_order, &Map.fetch!(all_map, &1))
+
+        all_typed_stmts =
+          rev_all_order
+          |> Enum.reverse()
+          |> Enum.map(&Map.fetch!(all_map, &1))
 
         res =
           build_result(
@@ -460,12 +444,14 @@ defmodule OpenUILang.Parser do
     cond do
       expr.k == :comp and expr.name == "Query" ->
         deps = AST.collect_state_refs(Enum.at(expr.args, 1))
+        all_state_refs = Enum.flat_map(expr.args, &AST.collect_state_refs/1)
 
         stmt = %{
           kind: :query,
           id: raw.id,
           call: %{callee: "Query", args: expr.args},
-          expr: expr
+          expr: expr,
+          state_refs: all_state_refs
         }
 
         if deps != [], do: Map.put(stmt, :deps, deps), else: stmt
@@ -475,14 +461,25 @@ defmodule OpenUILang.Parser do
           kind: :mutation,
           id: raw.id,
           call: %{callee: "Mutation", args: expr.args},
-          expr: expr
+          expr: expr,
+          state_refs: Enum.flat_map(expr.args, &AST.collect_state_refs/1)
         }
 
       raw.id_token_type == :state_var ->
-        %{kind: :state, id: raw.id, init: expr}
+        %{
+          kind: :state,
+          id: raw.id,
+          init: expr,
+          state_refs: AST.collect_state_refs(expr)
+        }
 
       true ->
-        %{kind: :value, id: raw.id, expr: expr}
+        %{
+          kind: :value,
+          id: raw.id,
+          expr: expr,
+          state_refs: AST.collect_state_refs(expr)
+        }
     end
   end
 
@@ -521,17 +518,7 @@ defmodule OpenUILang.Parser do
   defp resolves_to_component_call?(node, _syms, _seen), do: component_call?(node)
 
   defp contains_component?(node) do
-    found = :ets.new(:comp_check, [:set, :private])
-
-    try do
-      AST.walk_ast(node, fn cur ->
-        if component_call?(cur), do: :ets.insert(found, {:found, true})
-      end)
-
-      :ets.lookup(found, :found) != []
-    after
-      :ets.delete(found)
-    end
+    AST.any_ast?(node, &component_call?/1)
   end
 
   defp build_result(
@@ -633,10 +620,10 @@ defmodule OpenUILang.Parser do
       root: root,
       meta: %{
         incomplete: was_incomplete,
-        unresolved: ctx.unres,
+        unresolved: Enum.reverse(ctx.unres),
         orphaned: orphaned,
         statement_count: stmt_count,
-        errors: ctx.errors
+        errors: Enum.reverse(ctx.errors)
       },
       state_declarations: state_declarations,
       query_statements: query_statements,
@@ -693,27 +680,18 @@ defmodule OpenUILang.Parser do
 
     state_decls =
       Enum.reduce(stmts, state_decls, fn stmt, acc_st ->
-        nodes =
-          case stmt.kind do
-            :state -> [stmt.init]
-            :value -> [stmt.expr]
-            k when k in [:query, :mutation] -> stmt.call.args
+        deps = Map.get(stmt, :state_refs, [])
+
+        Enum.reduce(deps, acc_st, fn dep, st_map ->
+          skip? =
+            partial_ref != nil and dep == partial_ref.name and
+              MapSet.member?(partial_ref.stmt_ids, stmt.id)
+
+          if skip? or Map.has_key?(st_map, dep) do
+            st_map
+          else
+            Map.put(st_map, dep, nil)
           end
-
-        Enum.reduce(nodes, acc_st, fn node, inner_st ->
-          deps = AST.collect_state_refs(node)
-
-          Enum.reduce(deps, inner_st, fn dep, st_map ->
-            skip? =
-              partial_ref != nil and dep == partial_ref.name and
-                MapSet.member?(partial_ref.stmt_ids, stmt.id)
-
-            if skip? or Map.has_key?(st_map, dep) do
-              st_map
-            else
-              Map.put(st_map, dep, nil)
-            end
-          end)
         end)
       end)
 
