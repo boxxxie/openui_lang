@@ -75,6 +75,31 @@ defmodule OpenUILang.ZigNIF do
         ]
   def parse_merge_statements(_input, _strip_fences), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec register_schema(non_neg_integer(), binary()) :: :ok
+  def register_schema(_schema_id, _schema_bin), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec parse_and_materialize(String.t(), non_neg_integer(), binary(), String.t()) :: map()
+  def parse_and_materialize(_input, _schema_id, _schema_bin, _root_name),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec stream_new(non_neg_integer(), binary(), String.t()) :: reference()
+  def stream_new(_schema_id, _schema_bin, _root_name), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec stream_reset(reference()) :: :ok
+  def stream_reset(_stream_ref), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec stream_push(reference(), String.t(), non_neg_integer(), map()) :: {map(), map()}
+  def stream_push(_stream_ref, _chunk, _complete, _beam_mat_cache),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec stream_set(reference(), String.t(), non_neg_integer(), map()) :: {map(), map()}
+  def stream_set(_stream_ref, _full_text, _complete, _beam_mat_cache),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec stream_get(reference(), non_neg_integer(), map()) :: {map(), map()}
+  def stream_get(_stream_ref, _complete, _beam_mat_cache),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   # ── BEAM Literal-Pool Map Hydration ──────────────────────────────────────
   # Hydrating compact NIF tuples into Elixir map literals ensures that every map shares
   # the BEAM module literal pool's constant key tuple (0 heap words allocated for keys,

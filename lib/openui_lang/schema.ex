@@ -53,14 +53,28 @@ defmodule OpenUILang.Schema do
 
   @spec compile_schema(map() | nil) :: map()
   def compile_schema(nil) do
-    %{
-      components: %{},
-      call_defs: OpenUILang.Builtins.builtin_calls(),
-      bindable: %{},
-      functions_schema: %{},
-      actions_schema: %{},
-      root: nil
-    }
+    case :persistent_term.get({__MODULE__, :nil_compiled_schema}, nil) do
+      nil ->
+        compiled =
+          %{
+            components: %{},
+            call_defs: OpenUILang.Builtins.builtin_calls(),
+            bindable: %{},
+            functions_schema: %{},
+            functions_clean: %{},
+            actions_schema: %{},
+            actions_clean: %{},
+            action_params: %{},
+            root: nil
+          }
+          |> attach_zig_schema()
+
+        :persistent_term.put({__MODULE__, :nil_compiled_schema}, compiled)
+        compiled
+
+      compiled ->
+        compiled
+    end
   end
 
   def compile_schema(%{"schema" => inner_schema} = lib_spec) when is_map(inner_schema) do
@@ -72,6 +86,7 @@ defmodule OpenUILang.Schema do
       | bindable: Map.merge(compiled.bindable, bindable),
         root: Map.get(lib_spec, "root") || compiled.root
     }
+    |> attach_zig_schema()
   end
 
   def compile_schema(schema) when is_map(schema) do
@@ -148,6 +163,234 @@ defmodule OpenUILang.Schema do
       action_params: action_params,
       root: Map.get(schema, "root")
     }
+    |> attach_zig_schema()
+  end
+
+  @spec zig_schema_args(map() | nil) :: {non_neg_integer(), binary()}
+  def zig_schema_args(%{:__zig_schema_id__ => id, :__zig_schema_bin__ => bin}) do
+    {id, bin}
+  end
+
+  def zig_schema_args(nil) do
+    compiled = compile_schema(nil)
+    {compiled.__zig_schema_id__, compiled.__zig_schema_bin__}
+  end
+
+  def zig_schema_args(cat) when is_map(cat) do
+    compiled = attach_zig_schema(cat)
+    {compiled.__zig_schema_id__, compiled.__zig_schema_bin__}
+  end
+
+  defp attach_zig_schema(compiled) do
+    packed_bin = pack_zig_schema(compiled)
+    schema_id = :erlang.phash2(packed_bin, 0x7FFFFFFF) + 1
+    _ = OpenUILang.ZigNIF.register_schema(schema_id, packed_bin)
+
+    compiled
+    |> Map.put(:__zig_schema_id__, schema_id)
+    |> Map.put(:__zig_schema_bin__, packed_bin)
+  end
+
+  defp pack_str(nil), do: <<0::little-32>>
+  defp pack_str(s) when is_binary(s), do: <<byte_size(s)::little-32, s::binary>>
+
+  defp pack_default_val(nil), do: <<0::8>>
+  defp pack_default_val(false), do: <<1::8, 0::8>>
+  defp pack_default_val(true), do: <<1::8, 1::8>>
+  defp pack_default_val(v) when is_integer(v), do: <<2::8, v::little-signed-64>>
+  defp pack_default_val(v) when is_float(v), do: <<3::8, v::little-float-64>>
+  defp pack_default_val(v) when is_binary(v), do: <<4::8, byte_size(v)::little-32, v::binary>>
+
+  defp pack_default_val(v) when is_list(v) do
+    items_bin = for e <- v, into: <<>>, do: pack_default_val(e)
+    <<5::8, length(v)::little-32, items_bin::binary>>
+  end
+
+  defp pack_default_val(v) when is_map(v) do
+    keys = ordered_keys(v)
+
+    entries_bin =
+      for k <- keys, into: <<>> do
+        <<pack_str(to_string(k))::binary, pack_default_val(Map.get(v, k))::binary>>
+      end
+
+    <<6::8, length(keys)::little-32, entries_bin::binary>>
+  end
+
+  defp pack_default_val(_), do: <<0::8>>
+
+  defp pack_optional_default({:ok, dv}), do: <<1::8, pack_default_val(dv)::binary>>
+  defp pack_optional_default(_), do: <<0::8>>
+
+  defp pack_param(p, components) do
+    name = p.name
+    path = Map.get(p, :path) || "/" <> name
+    req_byte = if Map.get(p, :required) == true, do: 1, else: 0
+    def_bin = pack_optional_default(Map.get(p, :default_value, :undefined))
+    sc = Map.get(p, :schema)
+
+    sc_bin =
+      if is_map(sc) do
+        <<1::8, pack_schema_node(sc, components)::binary>>
+      else
+        <<0::8>>
+      end
+
+    <<pack_str(name)::binary, pack_str(path)::binary, req_byte::8, def_bin::binary, sc_bin::binary>>
+  end
+
+  defp pack_schema_node(s, components) when is_map(s) do
+    s = if Map.has_key?(s, :__kind__), do: s, else: precompile_schema_node(s)
+    kind = Map.get(s, :__kind__, :leaf)
+
+    elem_reject_expected =
+      cond do
+        kind == :composite -> ""
+        is_binary(s["type"]) -> s["type"]
+        is_list(s["enum"]) or Map.has_key?(s, "const") -> "a literal value"
+        true -> ""
+      end
+
+    prefix = pack_str(elem_reject_expected)
+
+    body =
+      case kind do
+        :composite ->
+          names = Map.get(s, :__slot_refs__) || slot_ref_names(s)
+
+          only_slot? =
+            names != [] and
+              Enum.all?(names, fn n -> n != nil and Map.has_key?(components, n) end)
+
+          slot_expected =
+            if only_slot? do
+              names |> Enum.reject(&is_nil/1) |> Enum.join(" | ")
+            else
+              ""
+            end
+
+          <<0::8, if(only_slot?, do: 1, else: 0)::8, pack_str(slot_expected)::binary>>
+
+        :object ->
+          props = if is_map(s["properties"]), do: s["properties"], else: %{}
+          required = if is_list(s["required"]), do: s["required"], else: []
+          ord_keys = Map.get(s, :__ord_keys__) || ordered_keys(props)
+
+          req_bin =
+            for req_key <- required, into: <<>> do
+              def_opt = get_schema_default_value(Map.get(props, req_key))
+              <<pack_str(req_key)::binary, pack_optional_default(def_opt)::binary>>
+            end
+
+          props_bin =
+            for k <- ord_keys, into: <<>> do
+              sub = Map.get(props, k)
+              is_req = if k in required, do: 1, else: 0
+              def_opt = get_schema_default_value(sub)
+
+              sub_bin =
+                if is_map(sub) do
+                  <<1::8, pack_schema_node(sub, components)::binary>>
+                else
+                  <<0::8>>
+                end
+
+              <<pack_str(k)::binary, is_req::8, pack_optional_default(def_opt)::binary,
+                sub_bin::binary>>
+            end
+
+          <<1::8, length(required)::little-32, req_bin::binary, length(ord_keys)::little-32,
+            props_bin::binary>>
+
+        :array ->
+          items = s["items"]
+
+          if not is_map(items) or Map.get(items, :__leaf__) == %{} do
+            <<2::8, 0::8>>
+          else
+            <<2::8, 1::8, pack_schema_node(items, components)::binary>>
+          end
+
+        :leaf ->
+          leaf = get_scalar_type_info(s)
+
+          cond do
+            leaf == %{} ->
+              <<3::8, 0::8>>
+
+            Map.get(leaf, :expected_type) == "string" ->
+              <<3::8, 1::8>>
+
+            Map.get(leaf, :expected_type) == "number" ->
+              <<3::8, 2::8>>
+
+            Map.get(leaf, :expected_type) == "boolean" ->
+              <<3::8, 3::8>>
+
+            Map.has_key?(leaf, :enum_values) ->
+              enum_vals = leaf.enum_values
+
+              rendered_enum =
+                enum_vals
+                |> Enum.map(&(:json.encode(&1) |> IO.iodata_to_binary()))
+                |> Enum.join(", ")
+
+              expected_str = "one of [#{rendered_enum}]"
+              vals_bin = for ev <- enum_vals, into: <<>>, do: pack_default_val(ev)
+
+              <<3::8, 4::8, pack_str(expected_str)::binary, length(enum_vals)::little-32,
+                vals_bin::binary>>
+
+            true ->
+              <<3::8, 0::8>>
+          end
+      end
+
+    <<prefix::binary, body::binary>>
+  end
+
+  defp pack_zig_schema(compiled) do
+    components = Map.get(compiled, :components, %{})
+    call_defs = Map.get(compiled, :call_defs) || OpenUILang.Builtins.builtin_calls()
+    root_str = Map.get(compiled, :root) || ""
+    comp_keys = Map.keys(components)
+
+    avail_suffix =
+      if comp_keys != [] do
+        ". Available components: #{Enum.join(comp_keys, ", ")}"
+      else
+        ""
+      end
+
+    comps_bin =
+      for c_name <- comp_keys, into: <<>> do
+        c_def = Map.fetch!(components, c_name)
+        params = Map.get(c_def, :params, [])
+        sig = build_params_signature(c_name, params)
+        params_bin = for p <- params, into: <<>>, do: pack_param(p, components)
+
+        <<pack_str(c_name)::binary, pack_str(sig)::binary, length(params)::little-32,
+          params_bin::binary>>
+      end
+
+    call_keys = Map.keys(call_defs)
+
+    calls_bin =
+      for f_name <- call_keys, into: <<>> do
+        f_def = Map.fetch!(call_defs, f_name)
+        params = Map.get(f_def, :params, [])
+        is_act = if Map.get(f_def, :kind) == :action, do: 1, else: 0
+        is_builtin = if Map.get(f_def, :builtin) == true, do: 1, else: 0
+        is_lazy = if Map.get(f_def, :lazy) == true, do: 1, else: 0
+        sig = build_params_signature(f_name, params)
+        params_bin = for p <- params, into: <<>>, do: pack_param(p, components)
+
+        <<pack_str(f_name)::binary, is_act::8, is_builtin::8, is_lazy::8, pack_str(sig)::binary,
+          length(params)::little-32, params_bin::binary>>
+      end
+
+    <<pack_str(root_str)::binary, pack_str(avail_suffix)::binary, length(comp_keys)::little-32,
+      comps_bin::binary, length(call_keys)::little-32, calls_bin::binary>>
   end
 
   defp extract_bindable_from_components(comps) when is_map(comps) do
@@ -279,8 +522,8 @@ defmodule OpenUILang.Schema do
   def build_params_signature(component, params) do
     rendered =
       Enum.map(params, fn p ->
-        type = get_type_from_schema(p.schema)
-        marked = if p.required, do: "#{p.name}*", else: p.name
+        type = get_type_from_schema(Map.get(p, :schema))
+        marked = if Map.get(p, :required), do: "#{p.name}*", else: p.name
         if type, do: "#{marked}: #{type}", else: marked
       end)
       |> Enum.join(", ")
