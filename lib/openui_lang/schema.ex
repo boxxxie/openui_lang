@@ -236,7 +236,8 @@ defmodule OpenUILang.Schema do
         <<0::8>>
       end
 
-    <<pack_str(name)::binary, pack_str(path)::binary, req_byte::8, def_bin::binary, sc_bin::binary>>
+    <<pack_str(name)::binary, pack_str(path)::binary, req_byte::8, def_bin::binary,
+      sc_bin::binary>>
   end
 
   defp pack_schema_node(s, components) when is_map(s) do
@@ -830,7 +831,15 @@ defmodule OpenUILang.Schema do
 
       case res do
         {:ok, next_item} ->
-          validate_array_items(rest, idx + 1, items_schema, component, path, [next_item | acc_items], ctx)
+          validate_array_items(
+            rest,
+            idx + 1,
+            items_schema,
+            component,
+            path,
+            [next_item | acc_items],
+            ctx
+          )
 
         :invalid ->
           validate_array_items(rest, idx + 1, items_schema, component, path, acc_items, ctx)

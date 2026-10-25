@@ -2,6 +2,7 @@ defmodule OpenUILang.MixProject do
   use Mix.Project
 
   @version "1.0.0"
+  @source_url "https://github.com/boxxxie/openui_lang"
 
   def project do
     [
@@ -13,8 +14,16 @@ defmodule OpenUILang.MixProject do
       aliases: aliases(),
       deps: deps(),
       description:
-        "Elixir parser, streaming engine, evaluator, and prompt generator for OpenUI Lang 1.0.",
-      package: package()
+        "High-performance Elixir + Zig NIF parser, streaming engine, evaluator, and prompt generator for OpenUI Lang 1.0.",
+      source_url: @source_url,
+      homepage_url: @source_url,
+      package: package(),
+      docs: [
+        main: "readme",
+        extras: ["README.md", "usage-rules.md"],
+        source_ref: "v#{@version}",
+        source_url: @source_url
+      ]
     ]
   end
 
@@ -31,13 +40,18 @@ defmodule OpenUILang.MixProject do
   end
 
   defp deps do
-    []
+    [
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+    ]
   end
 
   defp package do
     [
       files: ~w(lib native .formatter.exs mix.exs README.md usage-rules.md),
-      licenses: ["MIT"]
+      licenses: ["MIT"],
+      links: %{
+        "GitHub" => @source_url
+      }
     ]
   end
 

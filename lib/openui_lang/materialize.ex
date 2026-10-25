@@ -426,7 +426,10 @@ defmodule OpenUILang.Materialize do
       materialize_arr(rest, acc, %{ctx | unres: [n | ctx.unres]})
     else
       {val, ctx} = resolve_ref(n, ctx, :value)
-      if val == nil, do: materialize_arr(rest, acc, ctx), else: materialize_arr(rest, [val | acc], ctx)
+
+      if val == nil,
+        do: materialize_arr(rest, acc, ctx),
+        else: materialize_arr(rest, [val | acc], ctx)
     end
   end
 
@@ -658,7 +661,17 @@ defmodule OpenUILang.Materialize do
     {acc_props, has_dyn?, drop?, rev_missing, ctx}
   end
 
-  defp materialize_params([], [], _name, _all_params, acc_props, has_dyn?, drop?, rev_missing, ctx) do
+  defp materialize_params(
+         [],
+         [],
+         _name,
+         _all_params,
+         acc_props,
+         has_dyn?,
+         drop?,
+         rev_missing,
+         ctx
+       ) do
     {acc_props, has_dyn?, drop?, rev_missing, ctx}
   end
 
@@ -739,7 +752,9 @@ defmodule OpenUILang.Materialize do
 
       true ->
         mat_cache = ctx.mat_cache
-        cache_key = if mode == :value and is_map(mat_cache), do: {:value, name, ctx.partial}, else: nil
+
+        cache_key =
+          if mode == :value and is_map(mat_cache), do: {:value, name, ctx.partial}, else: nil
 
         case cache_key && Map.get(mat_cache, cache_key) do
           %{
@@ -751,7 +766,8 @@ defmodule OpenUILang.Materialize do
             unreached = ctx.unreached
 
             ctx =
-              if not is_map_key(unreached, name) and (sub_reached == [] or map_size(unreached) == 0) do
+              if not is_map_key(unreached, name) and
+                   (sub_reached == [] or map_size(unreached) == 0) do
                 ctx
               else
                 mark_reached_slow(ctx, unreached, name, sub_reached)
@@ -779,7 +795,9 @@ defmodule OpenUILang.Materialize do
               prev_unreached = ctx.unreached
               prev_in_pending = ctx.in_pending
               pending_ids = ctx.pending_ids
-              now_in_pending = prev_in_pending or (pending_ids != nil and is_map_key(pending_ids, name))
+
+              now_in_pending =
+                prev_in_pending or (pending_ids != nil and is_map_key(pending_ids, name))
 
               ctx =
                 if cache_key != nil do

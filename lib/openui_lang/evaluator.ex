@@ -894,11 +894,15 @@ defmodule OpenUILang.Evaluator do
     state_store = Map.get(parse_result, :state_declarations, %{})
 
     functions_clean =
-      (cat && (Map.get(cat, :functions_clean) || Map.delete(Map.get(cat, :functions_schema, %{}), "__keys__"))) ||
+      (cat &&
+         (Map.get(cat, :functions_clean) ||
+            Map.delete(Map.get(cat, :functions_schema, %{}), "__keys__"))) ||
         %{}
 
     actions_clean =
-      (cat && (Map.get(cat, :actions_clean) || Map.delete(Map.get(cat, :actions_schema, %{}), "__keys__"))) ||
+      (cat &&
+         (Map.get(cat, :actions_clean) ||
+            Map.delete(Map.get(cat, :actions_schema, %{}), "__keys__"))) ||
         %{}
 
     functions =

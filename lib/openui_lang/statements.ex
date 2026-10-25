@@ -149,7 +149,9 @@ defmodule OpenUILang.Statements do
     ZigNIF.auto_close(input)
   end
 
-  @spec split([Lexer.token()]) :: [%{id: String.t(), id_token_type: atom(), tokens: [Lexer.token()]}]
+  @spec split([Lexer.token()]) :: [
+          %{id: String.t(), id_token_type: atom(), tokens: [Lexer.token()]}
+        ]
   def split(tokens) when is_list(tokens) do
     do_split(tokens, [])
   end

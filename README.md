@@ -10,8 +10,8 @@ Used as the core language engine for **[`openui_tui`](https://github.com/boxxxie
 
 ## Features
 
-- **Zero External Dependencies:** Pure Elixir + OTP 27+ `:json` stdlib.
-- **Line-Oriented Streaming Parser (`OpenUILang.stream_parser/2`):** Re-parses and materializes the UI tree incrementally on every incoming LLM token chunk so Terminal UIs ([`openui_tui`](https://github.com/boxxxie/openui_tui)) or Phoenix LiveViews can render progressive frames in real time.
+- **Zero Runtime Package Dependencies:** Powered by a native **Zig NIF** (`native/openui_nif.zig`) for lexing, Pratt expression parsing, stateful stream buffering, AST materialization, and JSON Schema validation, paired with OTP 27+ `:json` stdlib.
+- **Line-Oriented Streaming Parser (`OpenUILang.stream_parser/2`):** Incrementally scans, parses, and materializes the UI tree on every incoming LLM token chunk (`~6.9 µs/chunk`) via a stateful `ErlNifResourceType` (`ZigStreamResource`) with zero-copy BEAM term caching so Terminal UIs ([`openui_tui`](https://github.com/boxxxie/openui_tui)) or Phoenix LiveViews can render progressive frames in real time.
 - **Positional-to-Named Schema Binding (`OpenUILang.compile_schema/1`):** Binds compact positional calls (`Stat("Throughput", $live_ops, "+12%", Sparkline($history, "info"))`) to JSON Schema `properties` in exact document key insertion order (`OpenUILang.decode_json!/1`).
 - **Statement-Level Diff & Patch Merging (`OpenUILang.merge_statements/3`):** Allows LLMs to emit surgical 1–3 line statement patches (`kpis = Row([...])`) instead of regenerating an entire UI program, automatically pruning orphaned subtrees.
 - **Reactive Runtime Evaluator (`OpenUILang.evaluate_result/2`):**
@@ -27,14 +27,12 @@ Used as the core language engine for **[`openui_tui`](https://github.com/boxxxie
 
 ## Installation
 
-Add `openui_lang` to your list of dependencies in `mix.exs`:
+Add `openui_lang` to your list of dependencies in `mix.exs` (requires `zig` in `PATH` to compile the native NIF):
 
 ```elixir
 def deps do
   [
-    {:openui_lang, github: "boxxxie/openui_lang"}
-    # Or when developing locally alongside openui_tui:
-    # {:openui_lang, path: "../openui_lang"}
+    {:openui_lang, "~> 1.0"}
   ]
 end
 ```
@@ -139,6 +137,7 @@ symbols = OpenUILang.parse_symbols(openui_code)
 | Module | File | Responsibility |
 | :--- | :--- | :--- |
 | `OpenUILang` | [`lib/openui_lang.ex`](lib/openui_lang.ex) | Public facade for parsing, streaming, evaluating, merging, demuxing, and prompt generation |
+| `OpenUILang.ZigNIF` | [`lib/openui_lang/zig_nif.ex`](lib/openui_lang/zig_nif.ex) • [`native/openui_nif.zig`](native/openui_nif.zig) | Native Zig NIF engine for lexing, Pratt parsing, stateful stream buffering (`ZigStreamResource`), AST materialization, and JSON Schema validation |
 | `OpenUILang.AST` | [`lib/openui_lang/ast.ex`](lib/openui_lang/ast.ex) | AST node constructors and helpers |
 | `OpenUILang.Lexer` | [`lib/openui_lang/lexer.ex`](lib/openui_lang/lexer.ex) | Statement splitter, string/comment scanner, and tokenizer |
 | `OpenUILang.Statements` | [`lib/openui_lang/statements.ex`](lib/openui_lang/statements.ex) | Top-level assignment, query, mutation, and `$state` declaration classifier |
