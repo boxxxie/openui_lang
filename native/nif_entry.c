@@ -1,5 +1,6 @@
 #include <erl_nif.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 // Forward declarations of Zig NIF functions
@@ -87,6 +88,14 @@ void* nif_alloc(size_t size) {
 
 void nif_free(void* ptr) {
     if (ptr != NULL) enif_free(ptr);
+}
+
+double nif_parse_double(const unsigned char* ptr, size_t len) {
+    char buf[128];
+    if (len == 0 || len >= sizeof(buf)) return 0.0;
+    memcpy(buf, ptr, len);
+    buf[len] = '\0';
+    return strtod(buf, NULL);
 }
 
 static ErlNifFunc nif_funcs[] = {

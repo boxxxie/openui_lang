@@ -324,15 +324,16 @@ defmodule OpenUILang.Evaluator do
     errors_ref = :ets.new(:runtime_errors, [:duplicate_bag, :private])
 
     try do
-      eval_ctx = Map.put(eval_ctx, :errors_ets, errors_ref)
+      cat = Map.get(eval_ctx, :cat)
+      schema_ctx = %{cat: cat}
+      eval_ctx = Map.put(eval_ctx, :errors_ets, errors_ref) |> Map.put(:schema_ctx, schema_ctx)
 
       tree =
         cond do
-          result[:root] != nil ->
+          Map.get(result, :root) != nil ->
             evaluate_element_props(result.root, eval_ctx)
 
-          result[:root_expression] != nil ->
-            schema_ctx = %{cat: eval_ctx[:cat]}
+          Map.get(result, :root_expression) != nil ->
             val = evaluate(result.root_expression, eval_ctx.ctx, schema_ctx)
 
             if AST.is_element_node?(val) do
@@ -353,8 +354,10 @@ defmodule OpenUILang.Evaluator do
         end
 
       runtime_errors =
-        :ets.lookup(errors_ref, :err)
-        |> Enum.map(fn {:err, err} -> err end)
+        case :ets.lookup(errors_ref, :err) do
+          [] -> []
+          rows -> Enum.map(rows, fn {:err, err} -> err end)
+        end
 
       {tree, runtime_errors}
     after
@@ -366,42 +369,75 @@ defmodule OpenUILang.Evaluator do
   def evaluate_element_props(%{has_dynamic_props: false} = el, _eval_ctx), do: el
 
   def evaluate_element_props(el, eval_ctx) do
-    schema_ctx = %{cat: eval_ctx[:cat]}
+    schema_ctx = Map.get(eval_ctx, :schema_ctx) || %{cat: Map.get(eval_ctx, :cat)}
     type_name = el.type_name
-    errors_ref = eval_ctx[:errors_ets]
+    errors_ref = Map.get(eval_ctx, :errors_ets)
+    has_custom? = Map.get(eval_ctx, :has_custom, true)
 
     evaluated_props =
       Map.new(el.props, fn {prop_key, value} ->
-        reactive? = bindable_prop?(schema_ctx, type_name, prop_key)
+        if not is_map(value) and not is_list(value) do
+          {prop_key, value}
+        else
+          reactive? = bindable_prop?(schema_ctx, type_name, prop_key)
 
-        report_fn = fn msg ->
-          if errors_ref do
-            record_runtime_error(errors_ref, %{
-              source: "runtime",
-              code: "runtime-error",
-              component: type_name,
-              statement_id: Map.get(el, :statement_id),
-              message: ~s(Evaluating prop "#{prop_key}" on #{type_name} failed: #{msg}),
-              hint: ~s(Check the expression used for prop "#{prop_key}")
-            })
-          end
+          prop_ctx =
+            if has_custom? and errors_ref != nil do
+              stmt_id = Map.get(el, :statement_id)
+              err_target = {errors_ref, type_name, stmt_id, prop_key}
+              %{eval_ctx | ctx: Map.put(eval_ctx.ctx, :err_target, err_target)}
+            else
+              eval_ctx
+            end
+
+          val =
+            try do
+              evaluate_prop_value(value, prop_ctx, schema_ctx, reactive?)
+            rescue
+              e ->
+                if errors_ref do
+                  emit_prop_error(
+                    errors_ref,
+                    type_name,
+                    Map.get(el, :statement_id),
+                    prop_key,
+                    Exception.message(e)
+                  )
+                end
+
+                value
+            end
+
+          {prop_key, val}
         end
-
-        prop_ctx = %{eval_ctx | ctx: Map.put(eval_ctx.ctx, :report_error, report_fn)}
-
-        val =
-          try do
-            evaluate_prop_value(value, prop_ctx, schema_ctx, reactive?)
-          rescue
-            e ->
-              report_fn.(Exception.message(e))
-              value
-          end
-
-        {prop_key, val}
       end)
 
     %{el | props: evaluated_props}
+  end
+
+  defp emit_prop_error(errors_ref, type_name, stmt_id, prop_key, msg) do
+    record_runtime_error(errors_ref, %{
+      source: "runtime",
+      code: "runtime-error",
+      component: type_name,
+      statement_id: stmt_id,
+      message: ~s(Evaluating prop "#{prop_key}" on #{type_name} failed: #{msg}),
+      hint: ~s(Check the expression used for prop "#{prop_key}")
+    })
+  end
+
+  defp report_ctx_error(context, msg) do
+    cond do
+      is_function(Map.get(context, :report_error), 1) ->
+        context.report_error.(msg)
+
+      match?({_, _, _, _}, Map.get(context, :err_target)) ->
+        {errors_ref, type_name, stmt_id, prop_key} = context.err_target
+        emit_prop_error(errors_ref, type_name, stmt_id, prop_key, msg)
+
+      true ->
+        :ok
+    end
   end
 
   defp evaluate_element_inline(%{has_dynamic_props: false} = el, _context, _schema_ctx), do: el
@@ -411,45 +447,106 @@ defmodule OpenUILang.Evaluator do
 
     evaluated_props =
       Map.new(el.props, fn {prop_key, value} ->
-        reactive? = bindable_prop?(schema_ctx, type_name, prop_key)
-        {prop_key, evaluate_prop_inline(value, context, schema_ctx, reactive?)}
+        if not is_map(value) and not is_list(value) do
+          {prop_key, value}
+        else
+          reactive? = bindable_prop?(schema_ctx, type_name, prop_key)
+          {prop_key, evaluate_prop_inline(value, context, schema_ctx, reactive?)}
+        end
       end)
 
     %{el | props: evaluated_props}
   end
 
   defp evaluate_prop_inline(value, context, schema_ctx, reactive?) do
-    res =
-      evaluate_prop_core(value, context, schema_ctx, reactive?, %{
-        recurse_element: fn el -> evaluate_element_inline(el, context, schema_ctx) end,
-        recurse: fn v, r? -> evaluate_prop_inline(v, context, schema_ctx, r?) end
-      })
-
+    res = evaluate_prop_core_inline(value, context, schema_ctx, reactive?)
     if is_action_plan?(res), do: own_steps(res), else: res
   end
 
   defp evaluate_prop_value(value, eval_ctx, schema_ctx, reactive?) do
-    res =
-      evaluate_prop_core(value, eval_ctx.ctx, schema_ctx, reactive?, %{
-        recurse_element: fn el -> evaluate_element_props(el, eval_ctx) end,
-        recurse: fn v, r? -> evaluate_prop_value(v, eval_ctx, schema_ctx, r?) end
-      })
-
+    res = evaluate_prop_core_root(value, eval_ctx, schema_ctx, reactive?)
     if is_action_plan?(res), do: own_steps(res), else: res
   end
 
-  defp evaluate_prop_core(nil, _context, _schema_ctx, _reactive?, _cbs), do: nil
+  defp evaluate_prop_core_root(nil, _eval_ctx, _schema_ctx, _reactive?), do: nil
 
-  defp evaluate_prop_core(value, _context, _schema_ctx, _reactive?, _cbs)
+  defp evaluate_prop_core_root(value, _eval_ctx, _schema_ctx, _reactive?)
        when not is_map(value) and not is_list(value) do
     value
   end
 
-  defp evaluate_prop_core(value, _context, _schema_ctx, reactive?, cbs) when is_list(value) do
-    Enum.map(value, fn v -> cbs.recurse.(v, reactive?) end)
+  defp evaluate_prop_core_root(value, eval_ctx, schema_ctx, reactive?) when is_list(value) do
+    Enum.map(value, fn v -> evaluate_prop_value(v, eval_ctx, schema_ctx, reactive?) end)
   end
 
-  defp evaluate_prop_core(value, context, schema_ctx, reactive?, cbs) when is_map(value) do
+  defp evaluate_prop_core_root(value, eval_ctx, schema_ctx, reactive?) when is_map(value) do
+    cond do
+      AST.is_ast_node?(value) ->
+        if value.k == :state_ref and reactive? do
+          %{
+            __reactive: "assign",
+            target: value.n,
+            expr: %{k: :state_ref, n: "$value"}
+          }
+        else
+          context = eval_ctx.ctx
+          result = evaluate(value, context, schema_ctx)
+
+          cond do
+            AST.is_element_node?(result) ->
+              evaluate_element_props(result, eval_ctx)
+
+            is_list(result) ->
+              Enum.map(result, fn item ->
+                if AST.is_element_node?(item),
+                  do: evaluate_element_props(item, eval_ctx),
+                  else: item
+              end)
+
+            is_reactive_assign?(result) and not reactive? ->
+              context.get_state.(result.target)
+
+            true ->
+              result
+          end
+        end
+
+      AST.is_element_node?(value) ->
+        evaluate_element_props(value, eval_ctx)
+
+      is_action_plan?(value) ->
+        value
+
+      true ->
+        needs_eval? =
+          Enum.any?(value, fn
+            {"__keys__", _} -> false
+            {_k, v} -> is_map(v) or is_list(v)
+          end)
+
+        if needs_eval? do
+          Map.new(value, fn
+            {"__keys__", keys} -> {"__keys__", keys}
+            {k, v} -> {k, evaluate_prop_value(v, eval_ctx, schema_ctx, reactive?)}
+          end)
+        else
+          value
+        end
+    end
+  end
+
+  defp evaluate_prop_core_inline(nil, _context, _schema_ctx, _reactive?), do: nil
+
+  defp evaluate_prop_core_inline(value, _context, _schema_ctx, _reactive?)
+       when not is_map(value) and not is_list(value) do
+    value
+  end
+
+  defp evaluate_prop_core_inline(value, context, schema_ctx, reactive?) when is_list(value) do
+    Enum.map(value, fn v -> evaluate_prop_inline(v, context, schema_ctx, reactive?) end)
+  end
+
+  defp evaluate_prop_core_inline(value, context, schema_ctx, reactive?) when is_map(value) do
     cond do
       AST.is_ast_node?(value) ->
         if value.k == :state_ref and reactive? do
@@ -463,11 +560,13 @@ defmodule OpenUILang.Evaluator do
 
           cond do
             AST.is_element_node?(result) ->
-              cbs.recurse_element.(result)
+              evaluate_element_inline(result, context, schema_ctx)
 
             is_list(result) ->
               Enum.map(result, fn item ->
-                if AST.is_element_node?(item), do: cbs.recurse_element.(item), else: item
+                if AST.is_element_node?(item),
+                  do: evaluate_element_inline(item, context, schema_ctx),
+                  else: item
               end)
 
             is_reactive_assign?(result) and not reactive? ->
@@ -479,22 +578,22 @@ defmodule OpenUILang.Evaluator do
         end
 
       AST.is_element_node?(value) ->
-        cbs.recurse_element.(value)
+        evaluate_element_inline(value, context, schema_ctx)
 
       is_action_plan?(value) ->
         value
 
       true ->
         needs_eval? =
-          value
-          |> Map.drop(["__keys__"])
-          |> Map.values()
-          |> Enum.any?(fn v -> is_map(v) or is_list(v) end)
+          Enum.any?(value, fn
+            {"__keys__", _} -> false
+            {_k, v} -> is_map(v) or is_list(v)
+          end)
 
         if needs_eval? do
           Map.new(value, fn
             {"__keys__", keys} -> {"__keys__", keys}
-            {k, v} -> {k, cbs.recurse.(v, reactive?)}
+            {k, v} -> {k, evaluate_prop_inline(v, context, schema_ctx, reactive?)}
           end)
         else
           value
@@ -561,8 +660,8 @@ defmodule OpenUILang.Evaluator do
 
     {checked, ctx} = Schema.validate_schema_value(value, schema, name, path, ctx)
 
-    if report_fn = Map.get(context, :report_error) do
-      Enum.each(ctx.errors, fn e -> report_fn.("@#{name}: #{e.message}") end)
+    if ctx.errors != [] do
+      Enum.each(ctx.errors, fn e -> report_ctx_error(context, "@#{name}: #{e.message}") end)
     end
 
     if strict and ctx.errors != [] do
@@ -599,10 +698,7 @@ defmodule OpenUILang.Evaluator do
             end
           rescue
             e ->
-              if report_fn = Map.get(context, :report_error) do
-                report_fn.("@#{name} threw: #{Exception.message(e)}")
-              end
-
+              report_ctx_error(context, "@#{name} threw: #{Exception.message(e)}")
               nil
           end
       end
@@ -797,23 +893,29 @@ defmodule OpenUILang.Evaluator do
     custom_fns = Map.get(opts, :functions, %{})
     state_store = Map.get(parse_result, :state_declarations, %{})
 
-    functions_schema = (cat && Map.get(cat, :functions_schema)) || %{}
-    actions_schema = (cat && Map.get(cat, :actions_schema)) || %{}
+    functions_clean =
+      (cat && (Map.get(cat, :functions_clean) || Map.delete(Map.get(cat, :functions_schema, %{}), "__keys__"))) ||
+        %{}
+
+    actions_clean =
+      (cat && (Map.get(cat, :actions_clean) || Map.delete(Map.get(cat, :actions_schema, %{}), "__keys__"))) ||
+        %{}
 
     functions =
-      functions_schema
-      |> Map.delete("__keys__")
-      |> Map.new(fn {name, fn_spec} ->
-        {name, Map.put(fn_spec, :fn, Map.get(custom_fns, name))}
-      end)
-
-    actions_clean = Map.delete(actions_schema, "__keys__")
+      if map_size(custom_fns) == 0 do
+        functions_clean
+      else
+        Map.new(functions_clean, fn {name, fn_spec} ->
+          {name, Map.put(fn_spec, :fn, Map.get(custom_fns, name))}
+        end)
+      end
 
     action_params =
-      Map.new(actions_clean, fn {name, act_spec} ->
-        props = get_in(act_spec, ["params", "properties"]) || %{}
-        {name, Schema.ordered_keys(props)}
-      end)
+      (cat && Map.get(cat, :action_params)) ||
+        Map.new(actions_clean, fn {name, act_spec} ->
+          props = get_in(act_spec, ["params", "properties"]) || %{}
+          {name, Schema.ordered_keys(props)}
+        end)
 
     ctx = %{
       get_state: fn name -> Map.get(state_store, name) end,
@@ -822,23 +924,29 @@ defmodule OpenUILang.Evaluator do
       actions: actions_clean
     }
 
-    resolve_ref_fn = fn name ->
-      q = Enum.find(parse_result.query_statements, &(&1.statement_id == name))
+    resolve_ref_fn =
+      if parse_result.query_statements == [] and parse_result.mutation_statements == [] do
+        ctx.resolve_ref
+      else
+        fn name ->
+          q = Enum.find(parse_result.query_statements, &(&1.statement_id == name))
 
-      cond do
-        q != nil ->
-          if q.defaults_ast != nil, do: evaluate(q.defaults_ast, ctx), else: nil
+          cond do
+            q != nil ->
+              if q.defaults_ast != nil, do: evaluate(q.defaults_ast, ctx), else: nil
 
-        Enum.any?(parse_result.mutation_statements, &(&1.statement_id == name)) ->
-          %{"status" => "idle", "data" => nil, "error" => nil}
+            Enum.any?(parse_result.mutation_statements, &(&1.statement_id == name)) ->
+              %{"status" => "idle", "data" => nil, "error" => nil}
 
-        true ->
-          nil
+            true ->
+              nil
+          end
+        end
       end
-    end
 
     ctx = %{ctx | resolve_ref: resolve_ref_fn}
-    eval_ctx = %{ctx: ctx, cat: cat, store: state_store}
+    has_custom = map_size(functions) > 0 or map_size(actions_clean) > 0
+    eval_ctx = %{ctx: ctx, cat: cat, store: state_store, has_custom: has_custom}
 
     {tree, runtime_errors} = evaluate_root(parse_result, eval_ctx)
 

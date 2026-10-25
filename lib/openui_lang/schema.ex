@@ -128,12 +128,24 @@ defmodule OpenUILang.Schema do
         end)
       end)
 
+    functions_clean = Map.delete(functions_map, "__keys__")
+    actions_clean = Map.delete(actions_map, "__keys__")
+
+    action_params =
+      Map.new(actions_clean, fn {name, act_spec} ->
+        props = get_in(act_spec, ["params", "properties"]) || %{}
+        {name, ordered_keys(props)}
+      end)
+
     %{
       components: components,
       call_defs: call_defs,
       bindable: Map.get(schema, "bindable", %{}),
       functions_schema: functions_map,
+      functions_clean: functions_clean,
       actions_schema: actions_map,
+      actions_clean: actions_clean,
+      action_params: action_params,
       root: Map.get(schema, "root")
     }
   end
@@ -174,6 +186,7 @@ defmodule OpenUILang.Schema do
 
       %{
         name: key,
+        path: "/" <> key,
         required: key in required,
         default_value: get_schema_default_value(prop_schema),
         schema: precompile_schema_node(inlined_schema)
@@ -538,13 +551,27 @@ defmodule OpenUILang.Schema do
     else
       items_schema = schema["items"]
 
-      if not is_map(items_schema) or Map.get(items_schema, :__leaf__) == %{} do
-        {{:ok, value}, ctx}
-      else
-        validate_array_items(value, 0, items_schema, component, path, [], ctx)
+      cond do
+        not is_map(items_schema) or Map.get(items_schema, :__leaf__) == %{} ->
+          {{:ok, value}, ctx}
+
+        composite_schema?(items_schema) ->
+          if all_elements_or_ast?(value) do
+            {{:ok, value}, ctx}
+          else
+            validate_array_items(value, 0, items_schema, component, path, [], ctx)
+          end
+
+        true ->
+          validate_array_items(value, 0, items_schema, component, path, [], ctx)
       end
     end
   end
+
+  defp all_elements_or_ast?([]), do: true
+  defp all_elements_or_ast?([%{type: "element"} | rest]), do: all_elements_or_ast?(rest)
+  defp all_elements_or_ast?([%{k: k} | rest]) when is_atom(k), do: all_elements_or_ast?(rest)
+  defp all_elements_or_ast?(_), do: false
 
   defp validate_array_items([], _idx, _items_schema, _component, _path, acc_items, ctx) do
     {{:ok, Enum.reverse(acc_items)}, ctx}

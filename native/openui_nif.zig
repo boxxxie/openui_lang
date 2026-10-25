@@ -19,6 +19,7 @@ extern fn nif_make_map_from_arrays(env: ?*ErlNifEnv, keys: ?[*]ERL_NIF_TERM, val
 extern fn nif_make_badarg(env: ?*ErlNifEnv) ERL_NIF_TERM;
 extern fn nif_alloc(size: usize) ?[*]u8;
 extern fn nif_free(ptr: ?[*]u8) void;
+extern fn nif_parse_double(ptr: [*]const u8, len: usize) f64;
 
 // Pre-cached BEAM atoms (populated in zig_nif_load)
 const Atoms = struct {
@@ -817,13 +818,13 @@ fn scanNumber(src: []const u8, start_pos: usize) struct { tok: ZigToken, next_po
     }
 
     if (!has_float) {
-        const parsed = std.fmt.parseInt(i64, num_slice, 10) catch 0;
+        const parsed = parseIntFast(num_slice);
         return .{
-            .tok = .{ .tag = .num_int, .slice = src[start_pos..i], .int_val = parsed * mult },
+            .tok = .{ .tag = .num_int, .slice = src[start_pos..i], .int_val = parsed *% mult },
             .next_pos = i,
         };
     } else {
-        const parsed = std.fmt.parseFloat(f64, num_slice) catch 0.0;
+        const parsed = nif_parse_double(num_slice.ptr, num_slice.len);
         const val = parsed * @as(f64, @floatFromInt(mult));
         const trunc_val = @trunc(val);
         if (val == trunc_val and val >= -9007199254740992.0 and val <= 9007199254740992.0) {
@@ -837,6 +838,25 @@ fn scanNumber(src: []const u8, start_pos: usize) struct { tok: ZigToken, next_po
             .next_pos = i,
         };
     }
+}
+
+fn parseIntFast(s: []const u8) i64 {
+    if (s.len == 0) return 0;
+    var idx: usize = 0;
+    var neg = false;
+    if (s[0] == '-') {
+        neg = true;
+        idx = 1;
+    } else if (s[0] == '+') {
+        idx = 1;
+    }
+    var acc: i64 = 0;
+    while (idx < s.len) : (idx += 1) {
+        const c = s[idx];
+        if (c < '0' or c > '9') break;
+        acc = acc *% 10 +% @as(i64, @intCast(c - '0'));
+    }
+    return if (neg) -%acc else acc;
 }
 
 fn tokenizeSlice(arena: *BumpArena, src: []const u8) []ZigToken {
