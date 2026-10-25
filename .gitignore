@@ -22,11 +22,12 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 openui_lang-*.tar
 
-# Ignore local secrets, environment files, and patch scratch dirs
+# Ignore local secrets, environment files, compiled NIFs, and patch scratch dirs
 .env
 .env.*
 !.env.example
 /config/*.secret.exs
+/priv/*.so
 /.tmp/
 /*.patch
 

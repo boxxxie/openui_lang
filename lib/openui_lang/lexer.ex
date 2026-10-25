@@ -19,6 +19,11 @@ defmodule OpenUILang.Lexer do
 
   @spec tokenize(String.t()) :: [token()]
   def tokenize(src) when is_binary(src) do
+    OpenUILang.ZigNIF.tokenize(src)
+  end
+
+  @doc false
+  def tokenize_elixir(src) when is_binary(src) do
     do_tokenize(src, [])
   end
 

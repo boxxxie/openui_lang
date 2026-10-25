@@ -73,7 +73,7 @@ defmodule OpenUILang.Materialize do
               code = if arg != nil, do: "null-required", else: "missing-required"
 
               acc_ctx =
-                Schema.push_validation_issue(acc_ctx, name, "/#{p.name}", %{
+                Schema.push_validation_issue(acc_ctx, name, Map.get(p, :path) || "/#{p.name}", %{
                   code: code,
                   signature: Schema.build_params_signature(name, params)
                 })
@@ -83,7 +83,13 @@ defmodule OpenUILang.Materialize do
 
           {:ok, val} ->
             {res, acc_ctx} =
-              Schema.validate_schema_value(val, p.schema, name, "/#{p.name}", acc_ctx)
+              Schema.validate_schema_value(
+                val,
+                p.schema,
+                name,
+                Map.get(p, :path) || "/#{p.name}",
+                acc_ctx
+              )
 
             case res do
               {:ok, ^val} ->
@@ -211,11 +217,11 @@ defmodule OpenUILang.Materialize do
 
   @spec materialize_expr(map(), map()) :: {map(), map()}
   def materialize_expr(node, ctx) do
-    materialize_expr_internal(node, ctx, MapSet.new())
+    materialize_expr_internal(node, ctx, %{})
   end
 
   defp materialize_expr_internal(%{k: :ref, n: n} = node, ctx, scoped_refs) do
-    if MapSet.member?(scoped_refs, n) do
+    if is_map_key(scoped_refs, n) do
       {node, ctx}
     else
       resolve_ref(n, ctx, :expr)
@@ -290,12 +296,17 @@ defmodule OpenUILang.Materialize do
   defp materialize_expr_internal(%{k: :bin_op, left: l, right: r} = node, ctx, scoped_refs) do
     {nl, ctx} = materialize_expr_internal(l, ctx, scoped_refs)
     {nr, ctx} = materialize_expr_internal(r, ctx, scoped_refs)
-    {%{node | left: nl, right: nr}, ctx}
+
+    if :erts_debug.same(nl, l) and :erts_debug.same(nr, r) do
+      {node, ctx}
+    else
+      {%{node | left: nl, right: nr}, ctx}
+    end
   end
 
   defp materialize_expr_internal(%{k: :unary_op, operand: op} = node, ctx, scoped_refs) do
     {nop, ctx} = materialize_expr_internal(op, ctx, scoped_refs)
-    {%{node | operand: nop}, ctx}
+    if :erts_debug.same(nop, op), do: {node, ctx}, else: {%{node | operand: nop}, ctx}
   end
 
   defp materialize_expr_internal(
@@ -306,23 +317,33 @@ defmodule OpenUILang.Materialize do
     {nc, ctx} = materialize_expr_internal(c, ctx, scoped_refs)
     {nt, ctx} = materialize_expr_internal(t, ctx, scoped_refs)
     {ne, ctx} = materialize_expr_internal(e, ctx, scoped_refs)
-    {%{node | cond: nc, then: nt, else: ne}, ctx}
+
+    if :erts_debug.same(nc, c) and :erts_debug.same(nt, t) and :erts_debug.same(ne, e) do
+      {node, ctx}
+    else
+      {%{node | cond: nc, then: nt, else: ne}, ctx}
+    end
   end
 
   defp materialize_expr_internal(%{k: :member, obj: obj} = node, ctx, scoped_refs) do
     {nobj, ctx} = materialize_expr_internal(obj, ctx, scoped_refs)
-    {%{node | obj: nobj}, ctx}
+    if :erts_debug.same(nobj, obj), do: {node, ctx}, else: {%{node | obj: nobj}, ctx}
   end
 
   defp materialize_expr_internal(%{k: :index, obj: obj, index: idx} = node, ctx, scoped_refs) do
     {nobj, ctx} = materialize_expr_internal(obj, ctx, scoped_refs)
     {nidx, ctx} = materialize_expr_internal(idx, ctx, scoped_refs)
-    {%{node | obj: nobj, index: nidx}, ctx}
+
+    if :erts_debug.same(nobj, obj) and :erts_debug.same(nidx, idx) do
+      {node, ctx}
+    else
+      {%{node | obj: nobj, index: nidx}, ctx}
+    end
   end
 
   defp materialize_expr_internal(%{k: :assign, value: val} = node, ctx, scoped_refs) do
     {nval, ctx} = materialize_expr_internal(val, ctx, scoped_refs)
-    {%{node | value: nval}, ctx}
+    if :erts_debug.same(nval, val), do: {node, ctx}, else: {%{node | value: nval}, ctx}
   end
 
   defp materialize_expr_internal(node, ctx, _scoped_refs), do: {node, ctx}
@@ -336,22 +357,7 @@ defmodule OpenUILang.Materialize do
   def materialize_value(%{k: :ph}, ctx), do: {nil, ctx}
 
   def materialize_value(%{k: :arr, els: els}, ctx) do
-    {rev_items, ctx} =
-      Enum.reduce(els, {[], ctx}, fn e, {acc, c} ->
-        if e.k == :ph do
-          {acc, c}
-        else
-          {val, c} = materialize_value(e, c)
-
-          if val == nil and e.k in [:comp, :ref] do
-            {acc, c}
-          else
-            {[val | acc], c}
-          end
-        end
-      end)
-
-    {Enum.reverse(rev_items), ctx}
+    materialize_arr(els, [], ctx)
   end
 
   def materialize_value(%{k: :obj, entries: entries}, ctx) do
@@ -378,7 +384,7 @@ defmodule OpenUILang.Materialize do
         {nil, ctx}
 
       runtime_call?(name, ctx) ->
-        case materialize_lazy_builtin(node, ctx, MapSet.new()) do
+        case materialize_lazy_builtin(node, ctx, %{}) do
           {:ok, lazy_node, ctx} ->
             {lazy_node, ctx}
 
@@ -413,74 +419,47 @@ defmodule OpenUILang.Materialize do
     end
   end
 
+  defp materialize_arr([], acc, ctx), do: {Enum.reverse(acc), ctx}
+
+  defp materialize_arr([%{k: :ref, n: n} | rest], acc, ctx) do
+    if not is_map_key(ctx.syms, n) do
+      materialize_arr(rest, acc, %{ctx | unres: [n | ctx.unres]})
+    else
+      {val, ctx} = resolve_ref(n, ctx, :value)
+
+      if val == nil,
+        do: materialize_arr(rest, acc, ctx),
+        else: materialize_arr(rest, [val | acc], ctx)
+    end
+  end
+
+  defp materialize_arr([%{k: :ph} | rest], acc, ctx) do
+    materialize_arr(rest, acc, ctx)
+  end
+
+  defp materialize_arr([e | rest], acc, ctx) do
+    {val, ctx} = materialize_value(e, ctx)
+
+    if val == nil and e.k == :comp do
+      materialize_arr(rest, acc, ctx)
+    else
+      materialize_arr(rest, [val | acc], ctx)
+    end
+  end
+
   defp materialize_component(name, args, params, ctx) do
-    {props, drop_component, ctx} =
-      params
-      |> Enum.zip(args)
-      |> Enum.reduce({%{}, false, ctx}, fn {param, arg_ast}, {acc_props, drop?, acc_ctx} ->
-        {val, acc_ctx} = materialize_value(arg_ast, acc_ctx)
-        acc_props = Map.put(acc_props, param.name, val)
-
-        if param.schema == nil do
-          {acc_props, drop?, acc_ctx}
-        else
-          {res, acc_ctx} =
-            Schema.validate_schema_value(val, param.schema, name, "/#{param.name}", acc_ctx)
-
-          case res do
-            {:ok, next_val} ->
-              {Map.put(acc_props, param.name, next_val), drop?, acc_ctx}
-
-            :invalid ->
-              case Schema.resolve_invalid_value(param.required, param.default_value) do
-                {:ok, default_val} ->
-                  {Map.put(acc_props, param.name, default_val), drop?, acc_ctx}
-
-                :omit ->
-                  {Map.delete(acc_props, param.name), drop?, acc_ctx}
-
-                :invalid ->
-                  {acc_props, true, acc_ctx}
-              end
-          end
-        end
-      end)
-
-    ctx =
-      if length(args) > length(params) do
-        Schema.push_validation_issue(ctx, name, "", %{
-          code: "excess-args",
-          declared: length(params),
-          got: length(args)
-        })
-      else
-        ctx
-      end
-
-    missing_required =
-      Enum.filter(params, fn p ->
-        p.required and (not Map.has_key?(props, p.name) or Map.get(props, p.name) == nil)
-      end)
-
-    {props, still_invalid} =
-      Enum.reduce(missing_required, {props, []}, fn p, {acc_props, inv_list} ->
-        case p.default_value do
-          {:ok, def_val} -> {Map.put(acc_props, p.name, def_val), inv_list}
-          :undefined -> {acc_props, [p | inv_list]}
-        end
-      end)
-
-    still_invalid = Enum.reverse(still_invalid)
+    {props, has_dynamic, drop_component, rev_missing, ctx} =
+      materialize_params(params, args, name, params, %{}, false, false, [], ctx)
 
     cond do
-      still_invalid != [] ->
-        ctx =
-          Enum.reduce(still_invalid, ctx, fn p, acc_ctx ->
-            code = if Map.has_key?(props, p.name), do: "null-required", else: "missing-required"
+      rev_missing != [] ->
+        sig = Schema.build_params_signature(name, params)
 
-            Schema.push_validation_issue(acc_ctx, name, "/#{p.name}", %{
+        ctx =
+          Enum.reduce(Enum.reverse(rev_missing), ctx, fn {code, p}, acc_ctx ->
+            Schema.push_validation_issue(acc_ctx, name, Map.get(p, :path) || "/#{p.name}", %{
               code: code,
-              signature: Schema.build_params_signature(name, params)
+              signature: sig
             })
           end)
 
@@ -490,8 +469,6 @@ defmodule OpenUILang.Materialize do
         {nil, ctx}
 
       true ->
-        has_dynamic = props |> Map.values() |> Enum.any?(&contains_dynamic_value?/1)
-
         el = %{
           type: "element",
           type_name: name,
@@ -504,61 +481,338 @@ defmodule OpenUILang.Materialize do
     end
   end
 
+  defp materialize_params(
+         [param | rest_params],
+         [arg_ast | rest_args],
+         name,
+         all_params,
+         acc_props,
+         has_dyn?,
+         drop?,
+         rev_missing,
+         ctx
+       ) do
+    {val, ctx} = materialize_value(arg_ast, ctx)
+    param_path = Map.get(param, :path) || "/#{param.name}"
+
+    if param.schema == nil do
+      finalize_param(
+        param,
+        val,
+        false,
+        rest_params,
+        rest_args,
+        name,
+        all_params,
+        acc_props,
+        has_dyn?,
+        drop?,
+        rev_missing,
+        ctx
+      )
+    else
+      {res, ctx} = Schema.validate_schema_value(val, param.schema, name, param_path, ctx)
+
+      case res do
+        {:ok, next_val} ->
+          finalize_param(
+            param,
+            next_val,
+            false,
+            rest_params,
+            rest_args,
+            name,
+            all_params,
+            acc_props,
+            has_dyn?,
+            drop?,
+            rev_missing,
+            ctx
+          )
+
+        :invalid ->
+          case Schema.resolve_invalid_value(param.required, param.default_value) do
+            {:ok, default_val} ->
+              finalize_param(
+                param,
+                default_val,
+                false,
+                rest_params,
+                rest_args,
+                name,
+                all_params,
+                acc_props,
+                has_dyn?,
+                drop?,
+                rev_missing,
+                ctx
+              )
+
+            :omit ->
+              materialize_params(
+                rest_params,
+                rest_args,
+                name,
+                all_params,
+                acc_props,
+                has_dyn?,
+                drop?,
+                rev_missing,
+                ctx
+              )
+
+            :invalid ->
+              finalize_param(
+                param,
+                val,
+                true,
+                rest_params,
+                rest_args,
+                name,
+                all_params,
+                acc_props,
+                has_dyn?,
+                true,
+                rev_missing,
+                ctx
+              )
+          end
+      end
+    end
+  end
+
+  defp materialize_params(
+         [param | rest_params],
+         [],
+         name,
+         all_params,
+         acc_props,
+         has_dyn?,
+         drop?,
+         rev_missing,
+         ctx
+       ) do
+    if param.required do
+      case param.default_value do
+        {:ok, def_val} ->
+          acc_props = Map.put(acc_props, param.name, def_val)
+          has_dyn? = has_dyn? or contains_dynamic_value?(def_val)
+
+          materialize_params(
+            rest_params,
+            [],
+            name,
+            all_params,
+            acc_props,
+            has_dyn?,
+            drop?,
+            rev_missing,
+            ctx
+          )
+
+        :undefined ->
+          materialize_params(
+            rest_params,
+            [],
+            name,
+            all_params,
+            acc_props,
+            has_dyn?,
+            drop?,
+            [{"missing-required", param} | rev_missing],
+            ctx
+          )
+      end
+    else
+      materialize_params(
+        rest_params,
+        [],
+        name,
+        all_params,
+        acc_props,
+        has_dyn?,
+        drop?,
+        rev_missing,
+        ctx
+      )
+    end
+  end
+
+  defp materialize_params(
+         [],
+         [_ | _] = extra_args,
+         name,
+         all_params,
+         acc_props,
+         has_dyn?,
+         drop?,
+         rev_missing,
+         ctx
+       ) do
+    declared = length(all_params)
+
+    ctx =
+      Schema.push_validation_issue(ctx, name, "", %{
+        code: "excess-args",
+        declared: declared,
+        got: declared + length(extra_args)
+      })
+
+    {acc_props, has_dyn?, drop?, rev_missing, ctx}
+  end
+
+  defp materialize_params(
+         [],
+         [],
+         _name,
+         _all_params,
+         acc_props,
+         has_dyn?,
+         drop?,
+         rev_missing,
+         ctx
+       ) do
+    {acc_props, has_dyn?, drop?, rev_missing, ctx}
+  end
+
+  defp finalize_param(
+         param,
+         val,
+         _was_invalid?,
+         rest_params,
+         rest_args,
+         name,
+         all_params,
+         acc_props,
+         has_dyn?,
+         drop?,
+         rev_missing,
+         ctx
+       ) do
+    if val == nil and param.required do
+      case param.default_value do
+        {:ok, def_val} ->
+          acc_props = Map.put(acc_props, param.name, def_val)
+          has_dyn? = has_dyn? or contains_dynamic_value?(def_val)
+
+          materialize_params(
+            rest_params,
+            rest_args,
+            name,
+            all_params,
+            acc_props,
+            has_dyn?,
+            drop?,
+            rev_missing,
+            ctx
+          )
+
+        :undefined ->
+          acc_props = Map.put(acc_props, param.name, nil)
+
+          materialize_params(
+            rest_params,
+            rest_args,
+            name,
+            all_params,
+            acc_props,
+            has_dyn?,
+            drop?,
+            [{"null-required", param} | rev_missing],
+            ctx
+          )
+      end
+    else
+      acc_props = Map.put(acc_props, param.name, val)
+      has_dyn? = has_dyn? or contains_dynamic_value?(val)
+
+      materialize_params(
+        rest_params,
+        rest_args,
+        name,
+        all_params,
+        acc_props,
+        has_dyn?,
+        drop?,
+        rev_missing,
+        ctx
+      )
+    end
+  end
+
   defp resolve_ref(name, ctx, mode) do
     cond do
-      MapSet.member?(ctx.visited, name) ->
+      not is_map_key(ctx.syms, name) ->
         ctx = %{ctx | unres: [name | ctx.unres]}
         {if(mode == :expr, do: %{k: :ph, n: name}, else: nil), ctx}
 
-      not Map.has_key?(ctx.syms, name) ->
+      is_map_key(ctx.visited, name) ->
         ctx = %{ctx | unres: [name | ctx.unres]}
         {if(mode == :expr, do: %{k: :ph, n: name}, else: nil), ctx}
 
       true ->
-        target = Map.fetch!(ctx.syms, name)
-        ctx = %{ctx | unreached: MapSet.delete(ctx.unreached, name)}
+        mat_cache = ctx.mat_cache
 
-        if target.k == :comp and Builtins.is_reserved_call?(target.name) do
-          ref_type = if target.name == "Mutation", do: :mutation, else: :query
-          {%{k: :runtime_ref, n: name, ref_type: ref_type}, ctx}
-        else
-          cache_key =
-            if mode == :value and is_map(Map.get(ctx, :mat_cache)) do
-              {:value, name, ctx.partial}
+        cache_key =
+          if mode == :value and is_map(mat_cache), do: {:value, name, ctx.partial}, else: nil
+
+        case cache_key && Map.get(mat_cache, cache_key) do
+          %{
+            result: cached_res,
+            errors: cached_errs,
+            unres: cached_unres,
+            sub_reached: sub_reached
+          } ->
+            unreached = ctx.unreached
+
+            ctx =
+              if not is_map_key(unreached, name) and
+                   (sub_reached == [] or map_size(unreached) == 0) do
+                ctx
+              else
+                mark_reached_slow(ctx, unreached, name, sub_reached)
+              end
+
+            if cached_errs == [] and cached_unres == [] do
+              {cached_res, ctx}
             else
-              nil
+              errors = if cached_errs == [], do: ctx.errors, else: cached_errs ++ ctx.errors
+              unres = if cached_unres == [], do: ctx.unres, else: cached_unres ++ ctx.unres
+              {cached_res, %{ctx | errors: errors, unres: unres}}
             end
 
-          case cache_key && Map.get(ctx.mat_cache, cache_key) do
-            %{result: cached_res, errors: cached_errs, unres: cached_unres, reached: cached_reached} ->
-              ctx = %{
-                ctx
-                | errors: cached_errs ++ ctx.errors,
-                  unres: cached_unres ++ ctx.unres,
-                  unreached: MapSet.difference(ctx.unreached, cached_reached)
-              }
+          _ ->
+            target = Map.fetch!(ctx.syms, name)
+            ctx = mark_single_reached(ctx, name)
 
-              {cached_res, ctx}
-
-            nil ->
+            if target.k == :comp and Builtins.is_reserved_call?(target.name) do
+              ref_type = if target.name == "Mutation", do: :mutation, else: :query
+              {%{k: :runtime_ref, n: name, ref_type: ref_type}, ctx}
+            else
               prev_id = ctx.current_statement_id
               prev_errors = ctx.errors
               prev_unres = ctx.unres
               prev_unreached = ctx.unreached
+              prev_in_pending = ctx.in_pending
+              pending_ids = ctx.pending_ids
+
+              now_in_pending =
+                prev_in_pending or (pending_ids != nil and is_map_key(pending_ids, name))
 
               ctx =
                 if cache_key != nil do
                   %{
                     ctx
-                    | visited: MapSet.put(ctx.visited, name),
+                    | visited: Map.put(ctx.visited, name, true),
                       current_statement_id: name,
+                      in_pending: now_in_pending,
                       errors: [],
                       unres: []
                   }
                 else
                   %{
                     ctx
-                    | visited: MapSet.put(ctx.visited, name),
+                    | visited: Map.put(ctx.visited, name, true),
                       current_statement_id: name
                   }
                 end
@@ -581,27 +835,42 @@ defmodule OpenUILang.Materialize do
                 if cache_key != nil do
                   sub_errors = ctx.errors
                   sub_unres = ctx.unres
-                  reached = MapSet.difference(prev_unreached, ctx.unreached) |> MapSet.put(name)
 
                   next_cache =
-                    if sub_unres == [] and
-                         (ctx[:pending_ids] == nil or
-                            (not MapSet.member?(ctx.pending_ids, name) and
-                               MapSet.disjoint?(reached, ctx.pending_ids))) do
-                      Map.put(ctx.mat_cache, cache_key, %{
-                        result: result,
-                        errors: sub_errors,
-                        unres: sub_unres,
-                        reached: reached
-                      })
+                    if sub_unres == [] and not now_in_pending do
+                      sub_reached =
+                        if map_size(prev_unreached) == map_size(ctx.unreached) do
+                          []
+                        else
+                          :maps.fold(
+                            fn k, _v, acc ->
+                              if is_map_key(ctx.unreached, k), do: acc, else: [k | acc]
+                            end,
+                            [],
+                            prev_unreached
+                          )
+                        end
+
+                      if pending_ids != nil and
+                           Enum.any?(sub_reached, &is_map_key(pending_ids, &1)) do
+                        ctx.mat_cache
+                      else
+                        Map.put(ctx.mat_cache, cache_key, %{
+                          result: result,
+                          errors: sub_errors,
+                          unres: sub_unres,
+                          sub_reached: sub_reached
+                        })
+                      end
                     else
                       ctx.mat_cache
                     end
 
                   %{
                     ctx
-                    | visited: MapSet.delete(ctx.visited, name),
+                    | visited: Map.delete(ctx.visited, name),
                       current_statement_id: prev_id,
+                      in_pending: prev_in_pending,
                       errors: sub_errors ++ prev_errors,
                       unres: sub_unres ++ prev_unres,
                       mat_cache: next_cache
@@ -609,14 +878,61 @@ defmodule OpenUILang.Materialize do
                 else
                   %{
                     ctx
-                    | visited: MapSet.delete(ctx.visited, name),
+                    | visited: Map.delete(ctx.visited, name),
                       current_statement_id: prev_id
                   }
                 end
 
               {result, ctx}
-          end
+            end
         end
+    end
+  end
+
+  defp mark_single_reached(ctx, name) do
+    unreached = ctx.unreached
+
+    if is_map_key(unreached, name) do
+      unreached = Map.delete(unreached, name)
+
+      if ctx.in_pending do
+        %{ctx | unreached: unreached, pending_reached: [name | ctx.pending_reached]}
+      else
+        %{ctx | unreached: unreached}
+      end
+    else
+      ctx
+    end
+  end
+
+  defp mark_reached_slow(ctx, unreached, name, sub_reached) do
+    in_pending? = ctx.in_pending
+    p_reached = ctx.pending_reached
+
+    {unreached, p_reached} =
+      if is_map_key(unreached, name) do
+        {Map.delete(unreached, name), if(in_pending?, do: [name | p_reached], else: p_reached)}
+      else
+        {unreached, p_reached}
+      end
+
+    {unreached, p_reached} =
+      if sub_reached == [] or map_size(unreached) == 0 do
+        {unreached, p_reached}
+      else
+        Enum.reduce(sub_reached, {unreached, p_reached}, fn k, {acc_u, acc_p} ->
+          if is_map_key(acc_u, k) do
+            {Map.delete(acc_u, k), if(in_pending?, do: [k | acc_p], else: acc_p)}
+          else
+            {acc_u, acc_p}
+          end
+        end)
+      end
+
+    if in_pending? do
+      %{ctx | unreached: unreached, pending_reached: p_reached}
+    else
+      %{ctx | unreached: unreached}
     end
   end
 
@@ -677,7 +993,7 @@ defmodule OpenUILang.Materialize do
       if var_name == nil do
         :none
       else
-        next_scoped = MapSet.put(scoped_refs, var_name)
+        next_scoped = Map.put(scoped_refs, var_name, true)
 
         {new_args, ctx} =
           args

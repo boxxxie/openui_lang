@@ -1,13 +1,11 @@
 defmodule OpenUILang.Statements do
   @moduledoc false
 
+  alias OpenUILang.ZigNIF
+
   @spec preprocess(String.t()) :: String.t()
   def preprocess(input) when is_binary(input) do
-    input
-    |> String.trim()
-    |> strip_fences()
-    |> strip_comments()
-    |> String.trim()
+    ZigNIF.preprocess(input)
   end
 
   @doc """
@@ -19,30 +17,7 @@ defmodule OpenUILang.Statements do
   """
   @spec demux(String.t()) :: %{prose: String.t(), code: String.t()}
   def demux(input) when is_binary(input) do
-    fenced_blocks = extract_fence_blocks(input, [])
-
-    if fenced_blocks != [] do
-      code = Enum.join(fenced_blocks, "\n") |> strip_comments() |> String.trim()
-
-      prose =
-        Regex.replace(~r/```(?:openui(?:-lang)?)?\n[\s\S]*?(?:```|$)/, input, "")
-        |> String.trim()
-
-      %{prose: prose, code: code}
-    else
-      lines = String.split(input, "\n")
-
-      {prose_lines, code_lines} =
-        Enum.split_while(lines, fn line ->
-          trimmed = String.trim(line)
-          not Regex.match?(~r/^(\$?[a-zA-Z_][a-zA-Z0-9_]*)\s*=(?!=)/, trimmed)
-        end)
-
-      %{
-        prose: Enum.join(prose_lines, "\n") |> String.trim(),
-        code: Enum.join(code_lines, "\n") |> strip_comments() |> String.trim()
-      }
-    end
+    ZigNIF.demux(input)
   end
 
   @spec strip_fences(String.t()) :: String.t()
@@ -165,144 +140,18 @@ defmodule OpenUILang.Statements do
     if :binary.match(input, ["//", "#"]) == :nomatch do
       input
     else
-      lines = String.split(input, "\n")
-
-      {out_lines, _in_str} =
-        Enum.map_reduce(lines, false, fn line, in_str ->
-          cond do
-            in_str == false and :binary.match(line, ["//", "#"]) == :nomatch ->
-              {line, scan_line_quote_state(line, false)}
-
-            true ->
-              strip_line_comment(line, line, 0, in_str)
-          end
-        end)
-
-      Enum.join(out_lines, "\n")
+      ZigNIF.strip_comments(input)
     end
-  end
-
-  defp scan_line_quote_state(<<>>, in_str), do: in_str
-
-  defp scan_line_quote_state(<<"\\", _esc, rest::binary>>, in_str) when in_str != false do
-    scan_line_quote_state(rest, in_str)
-  end
-
-  defp scan_line_quote_state(<<c, rest::binary>>, in_str) when in_str != false do
-    if c == in_str do
-      scan_line_quote_state(rest, false)
-    else
-      scan_line_quote_state(rest, in_str)
-    end
-  end
-
-  defp scan_line_quote_state(<<c, rest::binary>>, false) when c in [?", ?'] do
-    scan_line_quote_state(rest, c)
-  end
-
-  defp scan_line_quote_state(<<_c, rest::binary>>, false) do
-    scan_line_quote_state(rest, false)
-  end
-
-  defp strip_line_comment(orig, <<>>, _i, in_str) do
-    {orig, in_str}
-  end
-
-  defp strip_line_comment(orig, <<"\\", _esc, rest::binary>>, i, in_str) when in_str != false do
-    strip_line_comment(orig, rest, i + 2, in_str)
-  end
-
-  defp strip_line_comment(orig, <<c, rest::binary>>, i, in_str) when in_str != false do
-    if c == in_str do
-      strip_line_comment(orig, rest, i + 1, false)
-    else
-      strip_line_comment(orig, rest, i + 1, in_str)
-    end
-  end
-
-  defp strip_line_comment(orig, <<c, rest::binary>>, i, false) when c in [?", ?'] do
-    strip_line_comment(orig, rest, i + 1, c)
-  end
-
-  defp strip_line_comment(orig, <<"//", _rest::binary>>, i, false) do
-    {orig |> binary_part(0, i) |> String.trim_trailing(), false}
-  end
-
-  defp strip_line_comment(orig, <<"#", _rest::binary>>, i, false) do
-    {orig |> binary_part(0, i) |> String.trim_trailing(), false}
-  end
-
-  defp strip_line_comment(orig, <<_c, rest::binary>>, i, false) do
-    strip_line_comment(orig, rest, i + 1, false)
   end
 
   @spec auto_close(String.t()) :: %{text: String.t(), was_incomplete: boolean()}
   def auto_close(input) when is_binary(input) do
-    {stack, in_str, esc} = scan_balance(input, [], false, false)
-    was_incomplete = in_str != false or stack != []
-
-    if not was_incomplete do
-      %{text: input, was_incomplete: false}
-    else
-      out = input
-      out = if in_str != false and esc, do: out <> "\\", else: out
-      out = if in_str != false, do: out <> <<in_str>>, else: out
-
-      closing_brackets =
-        Enum.map(stack, fn
-          ?( -> ")"
-          ?[ -> "]"
-          ?{ -> "}"
-        end)
-        |> Enum.join()
-
-      %{text: out <> closing_brackets, was_incomplete: true}
-    end
+    ZigNIF.auto_close(input)
   end
 
-  defp scan_balance(<<>>, stack, in_str, esc), do: {stack, in_str, esc}
-
-  defp scan_balance(<<_c, rest::binary>>, stack, in_str, true) do
-    scan_balance(rest, stack, in_str, false)
-  end
-
-  defp scan_balance(<<"\\", rest::binary>>, stack, in_str, false) when in_str != false do
-    scan_balance(rest, stack, in_str, true)
-  end
-
-  defp scan_balance(<<c, rest::binary>>, stack, in_str, false) when in_str != false do
-    if c == in_str do
-      scan_balance(rest, stack, false, false)
-    else
-      scan_balance(rest, stack, in_str, false)
-    end
-  end
-
-  defp scan_balance(<<c, rest::binary>>, stack, false, false) when c in [?", ?'] do
-    scan_balance(rest, stack, c, false)
-  end
-
-  defp scan_balance(<<c, rest::binary>>, stack, false, false) when c in [?(, ?[, ?{] do
-    scan_balance(rest, [c | stack], false, false)
-  end
-
-  defp scan_balance(<<")", rest::binary>>, [?( | stack], false, false) do
-    scan_balance(rest, stack, false, false)
-  end
-
-  defp scan_balance(<<"]", rest::binary>>, [?[ | stack], false, false) do
-    scan_balance(rest, stack, false, false)
-  end
-
-  defp scan_balance(<<"}", rest::binary>>, [?{ | stack], false, false) do
-    scan_balance(rest, stack, false, false)
-  end
-
-  defp scan_balance(<<_c, rest::binary>>, stack, false, false) do
-    scan_balance(rest, stack, false, false)
-  end
-
-  @spec split([Lexer.token()]) :: [%{id: String.t(), id_token_type: atom(), tokens: [Lexer.token()]}]
+  @spec split([Lexer.token()]) :: [
+          %{id: String.t(), id_token_type: atom(), tokens: [Lexer.token()]}
+        ]
   def split(tokens) when is_list(tokens) do
     do_split(tokens, [])
   end
