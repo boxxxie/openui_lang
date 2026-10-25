@@ -176,12 +176,57 @@ defmodule OpenUILang.Schema do
         name: key,
         required: key in required,
         default_value: get_schema_default_value(prop_schema),
-        schema: inlined_schema
+        schema: precompile_schema_node(inlined_schema)
       }
     end)
   end
 
   defp compile_params(_, _), do: []
+
+  defp precompile_schema_node(s) when is_map(s) do
+    composite? =
+      Map.has_key?(s, "$ref") or Map.has_key?(s, "anyOf") or Map.has_key?(s, "oneOf") or
+        Map.has_key?(s, "allOf")
+
+    kind =
+      cond do
+        composite? -> :composite
+        s["type"] == "object" -> :object
+        s["type"] == "array" -> :array
+        true -> :leaf
+      end
+
+    s =
+      case kind do
+        :composite ->
+          Map.put(s, :__slot_refs__, slot_ref_names(s))
+
+        :array ->
+          items = s["items"]
+          if is_map(items), do: Map.put(s, "items", precompile_schema_node(items)), else: s
+
+        :object ->
+          props = if is_map(s["properties"]), do: s["properties"], else: %{}
+          ord_keys = ordered_keys(props)
+
+          compiled_props =
+            Map.new(props, fn
+              {"__keys__", v} -> {"__keys__", v}
+              {k, v} -> {k, precompile_schema_node(v)}
+            end)
+
+          s
+          |> Map.put("properties", compiled_props)
+          |> Map.put(:__ord_keys__, ord_keys)
+
+        :leaf ->
+          Map.put(s, :__leaf__, build_scalar_type_info(s))
+      end
+
+    Map.put(s, :__kind__, kind)
+  end
+
+  defp precompile_schema_node(other), do: other
 
   defp inline_action_refs(%{"$ref" => ref} = node, defs) when is_binary(ref) do
     case Map.get(defs, ref) do
@@ -352,7 +397,10 @@ defmodule OpenUILang.Schema do
 
       composite_schema?(schema) ->
         if only_component_slot?(schema, ctx) do
-          expected = slot_ref_names(schema) |> Enum.reject(&is_nil/1) |> Enum.join(" | ")
+          expected =
+            (Map.get(schema, :__slot_refs__) || slot_ref_names(schema))
+            |> Enum.reject(&is_nil/1)
+            |> Enum.join(" | ")
 
           actual =
             cond do
@@ -373,10 +421,10 @@ defmodule OpenUILang.Schema do
           {{:ok, value}, ctx}
         end
 
-      schema["type"] == "object" ->
+      Map.get(schema, :__kind__) == :object or schema["type"] == "object" ->
         validate_object_value(value, schema, component, path, ctx)
 
-      schema["type"] == "array" ->
+      Map.get(schema, :__kind__) == :array or schema["type"] == "array" ->
         validate_array_value(value, schema, component, path, ctx)
 
       true ->
@@ -446,8 +494,10 @@ defmodule OpenUILang.Schema do
           {value, false, ctx}
         end
 
+      ord_keys = Map.get(schema, :__ord_keys__) || ordered_keys(props)
+
       {out, invalid, ctx} =
-        Enum.reduce(ordered_keys(props), {out, invalid, ctx}, fn key, {acc_obj, inv, acc_ctx} ->
+        Enum.reduce(ord_keys, {out, invalid, ctx}, fn key, {acc_obj, inv, acc_ctx} ->
           if not Map.has_key?(acc_obj, key) do
             {acc_obj, inv, acc_ctx}
           else
@@ -491,20 +541,29 @@ defmodule OpenUILang.Schema do
       if not is_map(items_schema) do
         {{:ok, value}, ctx}
       else
-        {rev_items, ctx} =
-          value
-          |> Enum.with_index()
-          |> Enum.reduce({[], ctx}, fn {item, idx}, {acc_items, acc_ctx} ->
-            {res, acc_ctx} =
-              validate_schema_value(item, items_schema, component, "#{path}/#{idx}", acc_ctx)
+        validate_array_items(value, 0, items_schema, component, path, [], ctx)
+      end
+    end
+  end
 
-            case res do
-              {:ok, next_item} -> {[next_item | acc_items], acc_ctx}
-              :invalid -> {acc_items, acc_ctx}
-            end
-          end)
+  defp validate_array_items([], _idx, _items_schema, _component, _path, acc_items, ctx) do
+    {{:ok, Enum.reverse(acc_items)}, ctx}
+  end
 
-        {{:ok, Enum.reverse(rev_items)}, ctx}
+  defp validate_array_items([item | rest], idx, items_schema, component, path, acc_items, ctx) do
+    # Fast path: when item is an ElementNode and items_schema is composite, skip string interpolation!
+    if AST.is_element_node?(item) and composite_schema?(items_schema) do
+      validate_array_items(rest, idx + 1, items_schema, component, path, [item | acc_items], ctx)
+    else
+      item_path = "#{path}/#{Integer.to_string(idx)}"
+      {res, ctx} = validate_schema_value(item, items_schema, component, item_path, ctx)
+
+      case res do
+        {:ok, next_item} ->
+          validate_array_items(rest, idx + 1, items_schema, component, path, [next_item | acc_items], ctx)
+
+        :invalid ->
+          validate_array_items(rest, idx + 1, items_schema, component, path, acc_items, ctx)
       end
     end
   end
@@ -537,7 +596,10 @@ defmodule OpenUILang.Schema do
     end
   end
 
-  defp get_scalar_type_info(s) do
+  defp get_scalar_type_info(%{:__leaf__ => leaf}), do: leaf
+  defp get_scalar_type_info(s), do: build_scalar_type_info(s)
+
+  defp build_scalar_type_info(s) do
     cond do
       is_list(s["enum"]) -> %{enum_values: s["enum"]}
       Map.has_key?(s, "const") -> %{enum_values: [s["const"]]}
@@ -578,6 +640,9 @@ defmodule OpenUILang.Schema do
     end
   end
 
+  defp composite_schema?(%{:__kind__ => :composite}), do: true
+  defp composite_schema?(%{:__kind__ => _}), do: false
+
   defp composite_schema?(s) when is_map(s) do
     Map.has_key?(s, "$ref") or Map.has_key?(s, "anyOf") or Map.has_key?(s, "oneOf") or
       Map.has_key?(s, "allOf")
@@ -593,7 +658,7 @@ defmodule OpenUILang.Schema do
   end
 
   defp only_component_slot?(s, ctx) do
-    names = slot_ref_names(s)
+    names = Map.get(s, :__slot_refs__) || slot_ref_names(s)
     comps = if ctx.cat, do: ctx.cat.components, else: %{}
     names != [] and Enum.all?(names, fn n -> n != nil and Map.has_key?(comps, n) end)
   end

@@ -207,8 +207,9 @@ defmodule OpenUILang.Bench do
     end
   end
 
-  defp run_eprof_profile(schema, _medium_src, large_src, medium_chunks, patch_src) do
+  defp run_eprof_profile(schema, _medium_src, large_src, _medium_chunks, patch_src) do
     Mix.ensure_application!(:tools)
+    large_chunks = chunk_string(large_src, 48)
 
     profile_scenario("Profile A: Batch parse + evaluate_result (Large 105 stmts x10)", fn ->
       for _ <- 1..10 do
@@ -217,17 +218,15 @@ defmodule OpenUILang.Bench do
       end
     end)
 
-    profile_scenario("Profile B: Streaming push_chunk (Medium 46 chunks x10)", fn ->
-      for _ <- 1..10 do
-        sp = OpenUILang.stream_parser(schema)
-        total = length(medium_chunks)
+    profile_scenario("Profile B: Streaming push_chunk (Large 545 chunks x1)", fn ->
+      sp = OpenUILang.stream_parser(schema)
+      total = length(large_chunks)
 
-        Enum.with_index(medium_chunks, 1)
-        |> Enum.reduce(sp, fn {chunk, idx}, acc_sp ->
-          {_res, next_sp} = OpenUILang.push_chunk(acc_sp, chunk, idx == total)
-          next_sp
-        end)
-      end
+      Enum.with_index(large_chunks, 1)
+      |> Enum.reduce(sp, fn {chunk, idx}, acc_sp ->
+        {_res, next_sp} = OpenUILang.push_chunk(acc_sp, chunk, idx == total)
+        next_sp
+      end)
     end)
 
     profile_scenario("Profile C: merge_statements (Large 105 stmts x10)", fn ->

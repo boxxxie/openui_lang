@@ -522,35 +522,100 @@ defmodule OpenUILang.Materialize do
           ref_type = if target.name == "Mutation", do: :mutation, else: :query
           {%{k: :runtime_ref, n: name, ref_type: ref_type}, ctx}
         else
-          prev_id = ctx.current_statement_id
-
-          ctx = %{
-            ctx
-            | visited: MapSet.put(ctx.visited, name),
-              current_statement_id: name
-          }
-
-          {result, ctx} =
-            if mode == :value do
-              materialize_value(target, ctx)
+          cache_key =
+            if mode == :value and is_map(Map.get(ctx, :mat_cache)) do
+              {:value, name, ctx.partial}
             else
-              materialize_expr(target, ctx)
+              nil
             end
 
-          result =
-            if mode == :value and AST.is_element_node?(result) do
-              Map.put(result, :statement_id, name)
-            else
-              result
-            end
+          case cache_key && Map.get(ctx.mat_cache, cache_key) do
+            %{result: cached_res, errors: cached_errs, unres: cached_unres, reached: cached_reached} ->
+              ctx = %{
+                ctx
+                | errors: cached_errs ++ ctx.errors,
+                  unres: cached_unres ++ ctx.unres,
+                  unreached: MapSet.difference(ctx.unreached, cached_reached)
+              }
 
-          ctx = %{
-            ctx
-            | visited: MapSet.delete(ctx.visited, name),
-              current_statement_id: prev_id
-          }
+              {cached_res, ctx}
 
-          {result, ctx}
+            nil ->
+              prev_id = ctx.current_statement_id
+              prev_errors = ctx.errors
+              prev_unres = ctx.unres
+              prev_unreached = ctx.unreached
+
+              ctx =
+                if cache_key != nil do
+                  %{
+                    ctx
+                    | visited: MapSet.put(ctx.visited, name),
+                      current_statement_id: name,
+                      errors: [],
+                      unres: []
+                  }
+                else
+                  %{
+                    ctx
+                    | visited: MapSet.put(ctx.visited, name),
+                      current_statement_id: name
+                  }
+                end
+
+              {result, ctx} =
+                if mode == :value do
+                  materialize_value(target, ctx)
+                else
+                  materialize_expr(target, ctx)
+                end
+
+              result =
+                if mode == :value and AST.is_element_node?(result) do
+                  Map.put(result, :statement_id, name)
+                else
+                  result
+                end
+
+              ctx =
+                if cache_key != nil do
+                  sub_errors = ctx.errors
+                  sub_unres = ctx.unres
+                  reached = MapSet.difference(prev_unreached, ctx.unreached) |> MapSet.put(name)
+
+                  next_cache =
+                    if sub_unres == [] and
+                         (ctx[:pending_ids] == nil or
+                            (not MapSet.member?(ctx.pending_ids, name) and
+                               MapSet.disjoint?(reached, ctx.pending_ids))) do
+                      Map.put(ctx.mat_cache, cache_key, %{
+                        result: result,
+                        errors: sub_errors,
+                        unres: sub_unres,
+                        reached: reached
+                      })
+                    else
+                      ctx.mat_cache
+                    end
+
+                  %{
+                    ctx
+                    | visited: MapSet.delete(ctx.visited, name),
+                      current_statement_id: prev_id,
+                      errors: sub_errors ++ prev_errors,
+                      unres: sub_unres ++ prev_unres,
+                      mat_cache: next_cache
+                  }
+                else
+                  %{
+                    ctx
+                    | visited: MapSet.delete(ctx.visited, name),
+                      current_statement_id: prev_id
+                  }
+                end
+
+              {result, ctx}
+          end
         end
     end
   end

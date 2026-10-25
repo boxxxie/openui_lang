@@ -50,17 +50,11 @@ defmodule OpenUILang.Merge do
       []
     else
       %{text: closed} = Statements.auto_close(trimmed)
+      raw_slices = split_statement_source(closed)
+      stmts = closed |> Lexer.tokenize() |> Statements.split()
 
-      closed
-      |> split_statement_source()
-      |> Enum.flat_map(fn raw ->
-        case raw |> Lexer.tokenize() |> Statements.split() do
-          [stmt | _] ->
-            [%{id: stmt.id, ast: Expressions.parse_expression(stmt.tokens), raw: raw}]
-
-          [] ->
-            []
-        end
+      Enum.zip_with(raw_slices, stmts, fn raw, stmt ->
+        %{id: stmt.id, ast: Expressions.parse_expression(stmt.tokens), raw: raw}
       end)
     end
   end

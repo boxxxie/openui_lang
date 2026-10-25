@@ -11,9 +11,18 @@ defmodule OpenUILang.Parser do
     buf: "",
     cleaned: "",
     completed_end: 0,
+    completed_raw_end: 0,
     completed_stmt_map: %{},
     completed_stmt_order: [],
-    completed_count: 0
+    completed_count: 0,
+    completed_syms: %{},
+    completed_unreached: MapSet.new(),
+    completed_state_decls: %{},
+    completed_Init_state: %{},
+    completed_queries: [],
+    completed_mutations: [],
+    mat_cache: %{},
+    rev_deps: %{}
   ]
 
   @type t :: %__MODULE__{}
@@ -52,7 +61,7 @@ defmodule OpenUILang.Parser do
         {stmt_map, rev_order} =
           Enum.reduce(stmts, {%{}, []}, fn s, {acc_map, acc_order} ->
             expr = Expressions.parse_expression(s.tokens)
-            stmt = classify_statement(s, expr)
+            stmt = classify_statement(s, expr, false)
             acc_order = if Map.has_key?(acc_map, s.id), do: acc_order, else: [s.id | acc_order]
             {Map.put(acc_map, s.id, stmt), acc_order}
           end)
@@ -60,15 +69,20 @@ defmodule OpenUILang.Parser do
         stmt_order = Enum.reverse(rev_order)
         typed_stmts = Enum.map(stmt_order, &Map.fetch!(stmt_map, &1))
 
-        build_result(
-          stmt_map,
-          typed_stmts,
-          was_incomplete,
-          map_size(stmt_map),
-          cat,
-          root_name,
-          nil
-        )
+        {res, _cache} =
+          build_result(
+            stmt_map,
+            typed_stmts,
+            was_incomplete,
+            map_size(stmt_map),
+            cat,
+            root_name,
+            nil,
+            nil,
+            nil
+          )
+
+        res
       end
     end
   end
@@ -189,27 +203,53 @@ defmodule OpenUILang.Parser do
       | buf: "",
         cleaned: "",
         completed_end: 0,
+        completed_raw_end: 0,
         completed_stmt_map: %{},
         completed_stmt_order: [],
-        completed_count: 0
+        completed_count: 0,
+        completed_syms: %{},
+        completed_unreached: MapSet.new(),
+        completed_state_decls: %{},
+        completed_Init_state: %{},
+        completed_queries: [],
+        completed_mutations: [],
+        mat_cache: %{},
+        rev_deps: %{}
     }
   end
 
   defp refresh_cleaned(%__MODULE__{} = sp) do
-    next = Statements.preprocess(sp.buf)
-    prefix = binary_part(sp.cleaned, 0, min(sp.completed_end, byte_size(sp.cleaned)))
-
-    if not String.starts_with?(next, prefix) do
-      %{
-        sp
-        | cleaned: next,
-          completed_end: 0,
-          completed_stmt_map: %{},
-          completed_stmt_order: [],
-          completed_count: 0
-      }
+    if :binary.match(sp.buf, "```") == :nomatch and sp.completed_end > 0 and sp.completed_raw_end > 0 and
+         byte_size(sp.buf) >= sp.completed_raw_end do
+      prefix = binary_part(sp.cleaned, 0, sp.completed_end)
+      raw_tail = binary_part(sp.buf, sp.completed_raw_end, byte_size(sp.buf) - sp.completed_raw_end)
+      cleaned_tail = raw_tail |> Statements.strip_comments() |> String.trim_trailing()
+      %{sp | cleaned: prefix <> cleaned_tail}
     else
-      %{sp | cleaned: next}
+      next = Statements.preprocess(sp.buf)
+      prefix = binary_part(sp.cleaned, 0, min(sp.completed_end, byte_size(sp.cleaned)))
+
+      if not String.starts_with?(next, prefix) do
+        %{
+          sp
+          | cleaned: next,
+            completed_end: 0,
+            completed_raw_end: 0,
+            completed_stmt_map: %{},
+            completed_stmt_order: [],
+            completed_count: 0,
+            completed_syms: %{},
+            completed_unreached: MapSet.new(),
+            completed_state_decls: %{},
+            completed_Init_state: %{},
+            completed_queries: [],
+            completed_mutations: [],
+            mat_cache: %{},
+            rev_deps: %{}
+        }
+      else
+        %{sp | cleaned: next}
+      end
     end
   end
 
@@ -223,7 +263,7 @@ defmodule OpenUILang.Parser do
 
       Enum.reduce(stmts, sp, fn s, acc_sp ->
         expr = Expressions.parse_expression(s.tokens)
-        stmt = classify_statement(s, expr)
+        stmt = classify_statement(s, expr, true)
 
         order =
           if Map.has_key?(acc_sp.completed_stmt_map, s.id) do
@@ -232,21 +272,127 @@ defmodule OpenUILang.Parser do
             [s.id | acc_sp.completed_stmt_order]
           end
 
+        sym_ast = if stmt.kind == :state, do: stmt.init, else: stmt.expr
+        next_syms = Map.put(acc_sp.completed_syms, s.id, sym_ast)
+
+        next_unreached =
+          if stmt.kind in [:state, :query, :mutation] do
+            MapSet.delete(acc_sp.completed_unreached, s.id)
+          else
+            MapSet.put(acc_sp.completed_unreached, s.id)
+          end
+
+        next_state_decls =
+          Enum.reduce(stmt.state_refs, acc_sp.completed_state_decls, fn dep, st_map ->
+            if Map.has_key?(st_map, dep), do: st_map, else: Map.put(st_map, dep, nil)
+          end)
+
+        next_init_state =
+          if stmt.kind == :state do
+            Map.put(acc_sp.completed_Init_state, s.id, stmt)
+          else
+            Map.delete(acc_sp.completed_Init_state, s.id)
+          end
+
+        next_queries =
+          if stmt.kind == :query do
+            [stmt | Enum.reject(acc_sp.completed_queries, &(&1.id == s.id))]
+          else
+            Enum.reject(acc_sp.completed_queries, &(&1.id == s.id))
+          end
+
+        next_mutations =
+          if stmt.kind == :mutation do
+            [stmt | Enum.reject(acc_sp.completed_mutations, &(&1.id == s.id))]
+          else
+            Enum.reject(acc_sp.completed_mutations, &(&1.id == s.id))
+          end
+
+        rev_deps = update_rev_deps(acc_sp.rev_deps, s.id, stmt.refs)
+        mat_cache = invalidate_dependents(acc_sp.mat_cache, rev_deps, [s.id], MapSet.new([s.id]))
+
         %{
           acc_sp
           | completed_stmt_map: Map.put(acc_sp.completed_stmt_map, s.id, stmt),
             completed_stmt_order: order,
-            completed_count: acc_sp.completed_count + 1
+            completed_count: acc_sp.completed_count + 1,
+            completed_syms: next_syms,
+            completed_unreached: next_unreached,
+            completed_state_decls: next_state_decls,
+            completed_Init_state: next_init_state,
+            completed_queries: next_queries,
+            completed_mutations: next_mutations,
+            mat_cache: mat_cache,
+            rev_deps: rev_deps
         }
       end)
     end
+  end
+
+  defp update_rev_deps(rev_deps, stmt_id, refs) do
+    Enum.reduce(refs, rev_deps, fn ref, acc ->
+      existing = Map.get(acc, ref, [])
+      if stmt_id in existing, do: acc, else: Map.put(acc, ref, [stmt_id | existing])
+    end)
+  end
+
+  defp invalidate_dependents(cache, _rev_deps, [], _seen), do: cache
+
+  defp invalidate_dependents(cache, rev_deps, [id | rest], seen) do
+    cache = Map.delete(cache, {:value, id, true}) |> Map.delete({:value, id, false})
+    parents = Map.get(rev_deps, id, [])
+
+    {new_q, new_seen} =
+      Enum.reduce(parents, {rest, seen}, fn p, {q, s} ->
+        if MapSet.member?(s, p), do: {q, s}, else: {[p | q], MapSet.put(s, p)}
+      end)
+
+    invalidate_dependents(cache, rev_deps, new_q, new_seen)
   end
 
   defp scan_new_completed(%__MODULE__{} = sp) do
     len = byte_size(sp.cleaned)
     start = sp.completed_end
     rest = binary_part(sp.cleaned, start, len - start)
-    do_scan_completed(sp.cleaned, rest, start, start, 0, 0, false, sp)
+    {pending_start, sp} = do_scan_completed(sp.cleaned, rest, start, start, 0, 0, false, sp)
+
+    sp =
+      if sp.completed_end > start and :binary.match(sp.buf, "```") == :nomatch do
+        raw_end = advance_raw_newlines(sp.buf, sp.completed_raw_end, sp.cleaned, start, sp.completed_end)
+        %{sp | completed_raw_end: raw_end}
+      else
+        sp
+      end
+
+    {pending_start, sp}
+  end
+
+  defp advance_raw_newlines(buf, raw_pos, cleaned, clean_start, clean_end) do
+    raw_pos =
+      if raw_pos == 0 do
+        byte_size(buf) - byte_size(String.trim_leading(buf))
+      else
+        raw_pos
+      end
+
+    new_slice = binary_part(cleaned, clean_start, clean_end - clean_start)
+    nl_count = count_newlines(new_slice, 0)
+    skip_n_newlines(buf, raw_pos, byte_size(buf), nl_count)
+  end
+
+  defp count_newlines(<<>>, n), do: n
+  defp count_newlines(<<"\n", rest::binary>>, n), do: count_newlines(rest, n + 1)
+  defp count_newlines(<<_c, rest::binary>>, n), do: count_newlines(rest, n)
+
+  defp skip_n_newlines(_buf, pos, _len, 0), do: pos
+  defp skip_n_newlines(_buf, pos, len, _n) when pos >= len, do: len
+
+  defp skip_n_newlines(buf, pos, len, n) do
+    if :binary.at(buf, pos) == ?\n do
+      skip_n_newlines(buf, pos + 1, len, n - 1)
+    else
+      skip_n_newlines(buf, pos + 1, len, n)
+    end
   end
 
   defp do_scan_completed(_cleaned, <<>>, _i, stmt_start, _depth, _tdepth, _in_str, sp) do
@@ -325,23 +471,34 @@ defmodule OpenUILang.Parser do
       if sp.completed_count == 0 do
         {empty_result(), sp}
       else
-        typed_stmts =
-          sp.completed_stmt_order
-          |> Enum.reverse()
-          |> Enum.map(&Map.fetch!(sp.completed_stmt_map, &1))
+        non_val_stmts =
+          Map.values(sp.completed_Init_state) ++
+            Enum.reverse(sp.completed_queries) ++
+            Enum.reverse(sp.completed_mutations)
 
-        res =
+        pre = %{
+          syms: sp.completed_syms,
+          unreached: sp.completed_unreached,
+          base_state_decls: sp.completed_state_decls,
+          rev_order: sp.completed_stmt_order,
+          non_val_stmts: non_val_stmts,
+          pending_ids: nil
+        }
+
+        {res, mat_cache} =
           build_result(
             sp.completed_stmt_map,
-            typed_stmts,
+            nil,
             false,
             sp.completed_count,
             sp.cat,
             sp.root_name,
-            nil
+            nil,
+            sp.mat_cache,
+            pre
           )
 
-        {res, sp}
+        {res, %{sp | mat_cache: mat_cache}}
       end
     else
       %{text: closed, was_incomplete: was_incomplete} = Statements.auto_close(pending_text)
@@ -351,64 +508,118 @@ defmodule OpenUILang.Parser do
         if sp.completed_count == 0 do
           {empty_result(was_incomplete), sp}
         else
-          typed_stmts =
-            sp.completed_stmt_order
-            |> Enum.reverse()
-            |> Enum.map(&Map.fetch!(sp.completed_stmt_map, &1))
+          non_val_stmts =
+            Map.values(sp.completed_Init_state) ++
+              Enum.reverse(sp.completed_queries) ++
+              Enum.reverse(sp.completed_mutations)
 
-          res =
+          pre = %{
+            syms: sp.completed_syms,
+            unreached: sp.completed_unreached,
+            base_state_decls: sp.completed_state_decls,
+            rev_order: sp.completed_stmt_order,
+            non_val_stmts: non_val_stmts,
+            pending_ids: nil
+          }
+
+          {res, mat_cache} =
             build_result(
               sp.completed_stmt_map,
-              typed_stmts,
+              nil,
               was_incomplete,
               sp.completed_count,
               sp.cat,
               sp.root_name,
-              nil
+              nil,
+              sp.mat_cache,
+              pre
             )
 
-          {res, sp}
+          {res, %{sp | mat_cache: mat_cache}}
         end
       else
-        {all_map, rev_all_order, pending_ids} =
+        {all_map, rev_all_order, pending_ids, temp_rev_deps, all_syms, all_unreached, pending_stmts} =
           Enum.reduce(
             stmts,
-            {sp.completed_stmt_map, sp.completed_stmt_order, MapSet.new()},
-            fn s, {acc_map, acc_order, acc_pending} ->
+            {sp.completed_stmt_map, sp.completed_stmt_order, MapSet.new(), sp.rev_deps,
+             sp.completed_syms, sp.completed_unreached, []},
+            fn s, {acc_map, acc_order, acc_pending, acc_rdeps, acc_syms, acc_unr, acc_pstmts} ->
               if Map.has_key?(sp.completed_stmt_map, s.id) and was_incomplete do
-                {acc_map, acc_order, acc_pending}
+                {acc_map, acc_order, acc_pending, acc_rdeps, acc_syms, acc_unr, acc_pstmts}
               else
                 expr = Expressions.parse_expression(s.tokens)
-                stmt = classify_statement(s, expr)
+                stmt = classify_statement(s, expr, true)
 
                 acc_order =
                   if Map.has_key?(acc_map, s.id), do: acc_order, else: [s.id | acc_order]
 
-                {Map.put(acc_map, s.id, stmt), acc_order, MapSet.put(acc_pending, s.id)}
+                acc_rdeps = update_rev_deps(acc_rdeps, s.id, stmt.refs)
+                sym_ast = if stmt.kind == :state, do: stmt.init, else: stmt.expr
+                acc_syms = Map.put(acc_syms, s.id, sym_ast)
+
+                acc_unr =
+                  if stmt.kind in [:state, :query, :mutation] do
+                    MapSet.delete(acc_unr, s.id)
+                  else
+                    MapSet.put(acc_unr, s.id)
+                  end
+
+                {Map.put(acc_map, s.id, stmt), acc_order, MapSet.put(acc_pending, s.id),
+                 acc_rdeps, acc_syms, acc_unr, [stmt | acc_pstmts]}
               end
             end
           )
 
+        temp_cache =
+          invalidate_dependents(
+            sp.mat_cache,
+            temp_rev_deps,
+            MapSet.to_list(pending_ids),
+            pending_ids
+          )
+
         tail_name = detect_partial_state_tail(sp.buf, pending_text, complete)
         partial_ref = if tail_name, do: %{name: tail_name, stmt_ids: pending_ids}, else: nil
+        pending_stmts = Enum.reverse(pending_stmts)
 
-        all_typed_stmts =
-          rev_all_order
-          |> Enum.reverse()
-          |> Enum.map(&Map.fetch!(all_map, &1))
+        non_val_stmts =
+          if Enum.any?(pending_stmts, &(&1.kind in [:state, :query, :mutation])) or
+               sp.completed_queries != [] or sp.completed_mutations != [] do
+            rev_all_order
+            |> Enum.reverse()
+            |> Enum.reduce([], fn id, acc ->
+              st = Map.fetch!(all_map, id)
+              if st.kind in [:state, :query, :mutation], do: [st | acc], else: acc
+            end)
+            |> Enum.reverse()
+          else
+            Map.values(sp.completed_Init_state)
+          end
 
-        res =
+        pre = %{
+          syms: all_syms,
+          unreached: all_unreached,
+          base_state_decls: sp.completed_state_decls,
+          rev_order: rev_all_order,
+          non_val_stmts: non_val_stmts,
+          pending_stmts: pending_stmts,
+          pending_ids: pending_ids
+        }
+
+        {res, next_temp_cache} =
           build_result(
             all_map,
-            all_typed_stmts,
+            nil,
             was_incomplete,
             sp.completed_count + length(stmts),
             sp.cat,
             sp.root_name,
-            partial_ref
+            partial_ref,
+            temp_cache,
+            pre
           )
 
-        {res, sp}
+        {res, %{sp | mat_cache: next_temp_cache}}
       end
     end
   end
@@ -416,15 +627,17 @@ defmodule OpenUILang.Parser do
   defp detect_partial_state_tail(_buf, _pending_text, true), do: nil
 
   defp detect_partial_state_tail(buf, pending_text, false) do
-    case Regex.run(~r/\$\w+$/, buf) do
-      [tail] ->
+    case extract_trailing_state_var(buf) do
+      nil ->
+        nil
+
+      tail ->
         prefix_len = byte_size(pending_text) - byte_size(tail)
 
         if String.ends_with?(pending_text, tail) and prefix_len >= 0 do
           before_tail = binary_part(pending_text, 0, prefix_len)
-          escaped = Regex.escape(tail)
 
-          if not Regex.match?(~r/#{escaped}(?!\w)/, before_tail) do
+          if not contains_state_token?(before_tail, tail) do
             tail
           else
             nil
@@ -432,26 +645,72 @@ defmodule OpenUILang.Parser do
         else
           nil
         end
+    end
+  end
 
-      _ ->
+  defp extract_trailing_state_var(buf) do
+    len = byte_size(buf)
+    if len < 2, do: nil, else: scan_trailing_ident(buf, len - 1, len)
+  end
+
+  defp scan_trailing_ident(buf, i, len) when i >= 0 do
+    c = :binary.at(buf, i)
+
+    cond do
+      c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_ ->
+        if i == 0, do: nil, else: scan_trailing_ident(buf, i - 1, len)
+
+      c == ?$ and i < len - 1 ->
+        binary_part(buf, i, len - i)
+
+      true ->
         nil
+    end
+  end
+
+  defp contains_state_token?(haystack, tail) do
+    tlen = byte_size(tail)
+    hlen = byte_size(haystack)
+
+    case :binary.matches(haystack, tail) do
+      [] ->
+        false
+
+      matches ->
+        Enum.any?(matches, fn {pos, _} ->
+          after_pos = pos + tlen
+
+          if after_pos >= hlen do
+            true
+          else
+            c = :binary.at(haystack, after_pos)
+            not (c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_)
+          end
+        end)
     end
   end
 
   # ── Statement Classification & Result Building ───────────────────────────
 
-  defp classify_statement(raw, expr) do
+  defp classify_statement(raw, expr, need_refs?) do
+    {refs, state_refs} =
+      if need_refs? do
+        AST.collect_refs_and_state_refs(expr)
+      else
+        {[], AST.collect_state_refs(expr)}
+      end
+
     cond do
       expr.k == :comp and expr.name == "Query" ->
         deps = AST.collect_state_refs(Enum.at(expr.args, 1))
-        all_state_refs = Enum.flat_map(expr.args, &AST.collect_state_refs/1)
 
         stmt = %{
           kind: :query,
           id: raw.id,
           call: %{callee: "Query", args: expr.args},
           expr: expr,
-          state_refs: all_state_refs
+          state_refs: state_refs,
+          refs: refs
         }
 
         if deps != [], do: Map.put(stmt, :deps, deps), else: stmt
@@ -462,7 +721,8 @@ defmodule OpenUILang.Parser do
           id: raw.id,
           call: %{callee: "Mutation", args: expr.args},
           expr: expr,
-          state_refs: Enum.flat_map(expr.args, &AST.collect_state_refs/1)
+          state_refs: state_refs,
+          refs: refs
         }
 
       raw.id_token_type == :state_var ->
@@ -470,7 +730,8 @@ defmodule OpenUILang.Parser do
           kind: :state,
           id: raw.id,
           init: expr,
-          state_refs: AST.collect_state_refs(expr)
+          state_refs: state_refs,
+          refs: refs
         }
 
       true ->
@@ -478,7 +739,8 @@ defmodule OpenUILang.Parser do
           kind: :value,
           id: raw.id,
           expr: expr,
-          state_refs: AST.collect_state_refs(expr)
+          state_refs: state_refs,
+          refs: refs
         }
     end
   end
@@ -490,11 +752,15 @@ defmodule OpenUILang.Parser do
 
   defp component_call?(_), do: false
 
-  defp pick_entry(stmt_map, typed_stmts, root_name) do
+  defp pick_entry(stmt_map, typed_stmts, root_name, pre) do
     if Map.has_key?(stmt_map, @default_root_id) do
       %{id: @default_root_id, fallback: false}
     else
-      Enum.find_value(typed_stmts, fn stmt ->
+      stmts =
+        typed_stmts ||
+          (pre.rev_order |> Enum.reverse() |> Enum.map(&Map.fetch!(stmt_map, &1)))
+
+      Enum.find_value(stmts, fn stmt ->
         if stmt.kind == :value and component_call?(stmt.expr) and stmt.expr.name == root_name do
           %{id: stmt.id, fallback: true}
         else
@@ -528,23 +794,33 @@ defmodule OpenUILang.Parser do
          stmt_count,
          cat,
          root_name,
-         partial_ref
+         partial_ref,
+         mat_cache,
+         pre
        ) do
-    entry = pick_entry(stmt_map, typed_stmts, root_name)
+    entry = pick_entry(stmt_map, typed_stmts, root_name, pre)
 
     syms =
-      Map.new(stmt_map, fn {id, stmt} ->
-        {id, if(stmt.kind == :state, do: stmt.init, else: stmt.expr)}
-      end)
+      if pre != nil do
+        pre.syms
+      else
+        Map.new(stmt_map, fn {id, stmt} ->
+          {id, if(stmt.kind == :state, do: stmt.init, else: stmt.expr)}
+        end)
+      end
 
     unreached =
-      Enum.reduce(typed_stmts, MapSet.new(), fn stmt, acc ->
-        cond do
-          entry != nil and stmt.id == entry.id -> acc
-          stmt.kind in [:state, :query, :mutation] -> acc
-          true -> MapSet.put(acc, stmt.id)
-        end
-      end)
+      if pre != nil do
+        if entry != nil, do: MapSet.delete(pre.unreached, entry.id), else: pre.unreached
+      else
+        Enum.reduce(typed_stmts, MapSet.new(), fn stmt, acc ->
+          cond do
+            entry != nil and stmt.id == entry.id -> acc
+            stmt.kind in [:state, :query, :mutation] -> acc
+            true -> MapSet.put(acc, stmt.id)
+          end
+        end)
+      end
 
     ctx = %{
       syms: syms,
@@ -554,7 +830,9 @@ defmodule OpenUILang.Parser do
       visited: MapSet.new(),
       partial: was_incomplete,
       current_statement_id: entry && entry.id,
-      unreached: unreached
+      unreached: unreached,
+      mat_cache: mat_cache,
+      pending_ids: pre && pre[:pending_ids]
     }
 
     {root, root_expression, ctx} =
@@ -577,7 +855,7 @@ defmodule OpenUILang.Parser do
       end
 
     {state_declarations, query_statements, mutation_statements, ctx} =
-      extract_statements(typed_stmts, ctx, partial_ref)
+      extract_statements(typed_stmts, ctx, partial_ref, pre)
 
     ctx = %{ctx | current_statement_id: entry && entry.id}
     component = root_name || ""
@@ -608,10 +886,18 @@ defmodule OpenUILang.Parser do
       end
 
     orphaned =
-      if entry != nil do
-        typed_stmts
-        |> Enum.map(& &1.id)
-        |> Enum.filter(&MapSet.member?(ctx.unreached, &1))
+      if entry != nil and MapSet.size(ctx.unreached) > 0 do
+        if typed_stmts != nil do
+          Enum.reduce(typed_stmts, [], fn stmt, acc ->
+            if MapSet.member?(ctx.unreached, stmt.id), do: [stmt.id | acc], else: acc
+          end)
+          |> Enum.reverse()
+        else
+          # rev_order is in reverse order, so reducing over rev_order and prepending reverses it back to forward order!
+          Enum.reduce(pre.rev_order, [], fn id, acc ->
+            if MapSet.member?(ctx.unreached, id), do: [id | acc], else: acc
+          end)
+        end
       else
         []
       end
@@ -630,16 +916,21 @@ defmodule OpenUILang.Parser do
       mutation_statements: mutation_statements
     }
 
-    if root_expression != nil do
-      Map.put(base, :root_expression, root_expression)
-    else
-      base
-    end
+    res =
+      if root_expression != nil do
+        Map.put(base, :root_expression, root_expression)
+      else
+        base
+      end
+
+    {res, ctx.mat_cache}
   end
 
-  defp extract_statements(stmts, ctx, partial_ref) do
+  defp extract_statements(stmts, ctx, partial_ref, pre) do
+    stmts_to_iter = if pre != nil, do: pre.non_val_stmts, else: stmts
+
     {state_decls, queries, mutations, ctx} =
-      Enum.reduce(stmts, {%{}, [], [], ctx}, fn stmt, {st_acc, q_acc, m_acc, acc_ctx} ->
+      Enum.reduce(stmts_to_iter, {%{}, [], [], ctx}, fn stmt, {st_acc, q_acc, m_acc, acc_ctx} ->
         case stmt.kind do
           :state ->
             {val, acc_ctx} = Materialize.materialize_value(stmt.init, acc_ctx)
@@ -679,21 +970,42 @@ defmodule OpenUILang.Parser do
       end)
 
     state_decls =
-      Enum.reduce(stmts, state_decls, fn stmt, acc_st ->
-        deps = Map.get(stmt, :state_refs, [])
+      if pre != nil and pre[:base_state_decls] != nil do
+        merged_base = Map.merge(pre.base_state_decls, state_decls)
+        pending_stmts = pre[:pending_stmts] || []
 
-        Enum.reduce(deps, acc_st, fn dep, st_map ->
-          skip? =
-            partial_ref != nil and dep == partial_ref.name and
-              MapSet.member?(partial_ref.stmt_ids, stmt.id)
+        Enum.reduce(pending_stmts, merged_base, fn stmt, acc_st ->
+          deps = Map.get(stmt, :state_refs, [])
 
-          if skip? or Map.has_key?(st_map, dep) do
-            st_map
-          else
-            Map.put(st_map, dep, nil)
-          end
+          Enum.reduce(deps, acc_st, fn dep, st_map ->
+            skip? =
+              partial_ref != nil and dep == partial_ref.name and
+                MapSet.member?(partial_ref.stmt_ids, stmt.id)
+
+            if skip? or Map.has_key?(st_map, dep) do
+              st_map
+            else
+              Map.put(st_map, dep, nil)
+            end
+          end)
         end)
-      end)
+      else
+        Enum.reduce(stmts, state_decls, fn stmt, acc_st ->
+          deps = Map.get(stmt, :state_refs, [])
+
+          Enum.reduce(deps, acc_st, fn dep, st_map ->
+            skip? =
+              partial_ref != nil and dep == partial_ref.name and
+                MapSet.member?(partial_ref.stmt_ids, stmt.id)
+
+            if skip? or Map.has_key?(st_map, dep) do
+              st_map
+            else
+              Map.put(st_map, dep, nil)
+            end
+          end)
+        end)
+      end
 
     {state_decls, queries, mutations, ctx}
   end

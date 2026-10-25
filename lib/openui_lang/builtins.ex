@@ -89,7 +89,9 @@ defmodule OpenUILang.Builtins do
 
   @builtin_calls Map.merge(@builtin_functions, @builtin_steps)
 
-  @reserved_calls MapSet.new(["Query", "Mutation"])
+  @builtin_function_names Map.keys(@builtin_functions)
+  @builtin_step_names Map.keys(@builtin_steps)
+  @builtin_call_names Map.keys(@builtin_calls)
 
   @spec builtin_calls() :: map()
   def builtin_calls, do: @builtin_calls
@@ -101,19 +103,27 @@ defmodule OpenUILang.Builtins do
   def builtin_steps, do: @builtin_steps
 
   @spec is_builtin?(String.t()) :: boolean()
-  def is_builtin?(name), do: Map.has_key?(@builtin_calls, name)
+  def is_builtin?(name) when name in @builtin_call_names, do: true
+  def is_builtin?(_), do: false
 
   @spec is_builtin_function?(String.t()) :: boolean()
-  def is_builtin_function?(name), do: Map.has_key?(@builtin_functions, name)
+  def is_builtin_function?(name) when name in @builtin_function_names, do: true
+  def is_builtin_function?(_), do: false
 
   @spec is_step?(String.t(), map() | nil) :: boolean()
-  def is_step?(name, custom_actions \\ nil) do
-    Map.has_key?(@builtin_steps, name) or
-      (is_map(custom_actions) and Map.has_key?(custom_actions, name))
+  def is_step?(name, custom_actions \\ nil)
+  def is_step?(name, _custom_actions) when name in @builtin_step_names, do: true
+
+  def is_step?(name, custom_actions) when is_map(custom_actions) do
+    Map.has_key?(custom_actions, name)
   end
 
+  def is_step?(_name, _custom_actions), do: false
+
   @spec is_reserved_call?(String.t()) :: boolean()
-  def is_reserved_call?(name), do: MapSet.member?(@reserved_calls, name)
+  def is_reserved_call?("Query"), do: true
+  def is_reserved_call?("Mutation"), do: true
+  def is_reserved_call?(_), do: false
 
   # ── JS Type Coercion & Equality ──────────────────────────────────────────
 

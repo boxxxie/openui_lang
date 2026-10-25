@@ -169,15 +169,39 @@ defmodule OpenUILang.Statements do
 
       {out_lines, _in_str} =
         Enum.map_reduce(lines, false, fn line, in_str ->
-          if in_str == false and :binary.match(line, ["//", "#", "\"", "'"]) == :nomatch do
-            {line, false}
-          else
-            strip_line_comment(line, line, 0, in_str)
+          cond do
+            in_str == false and :binary.match(line, ["//", "#"]) == :nomatch ->
+              {line, scan_line_quote_state(line, false)}
+
+            true ->
+              strip_line_comment(line, line, 0, in_str)
           end
         end)
 
       Enum.join(out_lines, "\n")
     end
+  end
+
+  defp scan_line_quote_state(<<>>, in_str), do: in_str
+
+  defp scan_line_quote_state(<<"\\", _esc, rest::binary>>, in_str) when in_str != false do
+    scan_line_quote_state(rest, in_str)
+  end
+
+  defp scan_line_quote_state(<<c, rest::binary>>, in_str) when in_str != false do
+    if c == in_str do
+      scan_line_quote_state(rest, false)
+    else
+      scan_line_quote_state(rest, in_str)
+    end
+  end
+
+  defp scan_line_quote_state(<<c, rest::binary>>, false) when c in [?", ?'] do
+    scan_line_quote_state(rest, c)
+  end
+
+  defp scan_line_quote_state(<<_c, rest::binary>>, false) do
+    scan_line_quote_state(rest, false)
   end
 
   defp strip_line_comment(orig, <<>>, _i, in_str) do
@@ -278,19 +302,19 @@ defmodule OpenUILang.Statements do
     scan_balance(rest, stack, false, false)
   end
 
-  @spec split([map()]) :: [%{id: String.t(), id_token_type: atom(), tokens: [map()]}]
+  @spec split([Lexer.token()]) :: [%{id: String.t(), id_token_type: atom(), tokens: [Lexer.token()]}]
   def split(tokens) when is_list(tokens) do
     do_split(tokens, [])
   end
 
   defp do_split([], acc), do: Enum.reverse(acc)
-  defp do_split([%{t: :eof} | _], acc), do: Enum.reverse(acc)
+  defp do_split([:eof | _], acc), do: Enum.reverse(acc)
 
-  defp do_split([%{t: :newline} | rest], acc) do
+  defp do_split([:newline | rest], acc) do
     do_split(rest, acc)
   end
 
-  defp do_split([%{t: t, v: id}, %{t: :equals} | rest], acc)
+  defp do_split([{t, id}, :equals | rest], acc)
        when t in [:ident, :type, :state_var] do
     {expr_tokens, remaining} = collect_expr_tokens(rest, 0, 0, [])
 
@@ -310,17 +334,17 @@ defmodule OpenUILang.Statements do
   end
 
   defp skip_to_newline([]), do: []
-  defp skip_to_newline([%{t: :eof} | _] = toks), do: toks
-  defp skip_to_newline([%{t: :newline} | _] = toks), do: toks
+  defp skip_to_newline([:eof | _] = toks), do: toks
+  defp skip_to_newline([:newline | _] = toks), do: toks
   defp skip_to_newline([_ | rest]), do: skip_to_newline(rest)
 
   defp collect_expr_tokens([], _depth, _tdepth, acc), do: {Enum.reverse(acc), []}
 
-  defp collect_expr_tokens([%{t: :eof} | _] = toks, _depth, _tdepth, acc) do
+  defp collect_expr_tokens([:eof | _] = toks, _depth, _tdepth, acc) do
     {Enum.reverse(acc), toks}
   end
 
-  defp collect_expr_tokens([%{t: :newline} | rest] = toks, depth, tdepth, acc) do
+  defp collect_expr_tokens([:newline | rest] = toks, depth, tdepth, acc) do
     if depth <= 0 and tdepth <= 0 do
       next_t = peek_next_non_newline(rest)
 
@@ -334,19 +358,19 @@ defmodule OpenUILang.Statements do
     end
   end
 
-  defp collect_expr_tokens([%{t: t} = tok | rest], depth, tdepth, acc) do
+  defp collect_expr_tokens([tok | rest], depth, tdepth, acc) do
     {new_depth, new_tdepth} =
       cond do
-        t in [:lparen, :lbrack, :lbrace] ->
+        tok in [:lparen, :lbrack, :lbrace] ->
           {depth + 1, tdepth}
 
-        t in [:rparen, :rbrack, :rbrace] and depth > 0 ->
+        tok in [:rparen, :rbrack, :rbrace] and depth > 0 ->
           {depth - 1, tdepth}
 
-        t == :question and depth == 0 ->
+        tok == :question and depth == 0 ->
           {depth, tdepth + 1}
 
-        t == :colon and depth == 0 and tdepth > 0 ->
+        tok == :colon and depth == 0 and tdepth > 0 ->
           {depth, tdepth - 1}
 
         true ->
@@ -357,6 +381,7 @@ defmodule OpenUILang.Statements do
   end
 
   defp peek_next_non_newline([]), do: :eof
-  defp peek_next_non_newline([%{t: :newline} | rest]), do: peek_next_non_newline(rest)
-  defp peek_next_non_newline([%{t: t} | _]), do: t
+  defp peek_next_non_newline([:newline | rest]), do: peek_next_non_newline(rest)
+  defp peek_next_non_newline([{t, _} | _]), do: t
+  defp peek_next_non_newline([t | _]), do: t
 end

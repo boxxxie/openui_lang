@@ -1,43 +1,43 @@
 defmodule OpenUILang.AST do
   @moduledoc false
 
-  @ast_kinds MapSet.new([
-               :comp,
-               :ref,
-               :state_ref,
-               :runtime_ref,
-               :bin_op,
-               :unary_op,
-               :ternary,
-               :member,
-               :index,
-               :assign,
-               :str,
-               :num,
-               :bool,
-               :null,
-               :arr,
-               :obj,
-               :ph
-             ])
+  @ast_kinds [
+    :comp,
+    :ref,
+    :state_ref,
+    :runtime_ref,
+    :bin_op,
+    :unary_op,
+    :ternary,
+    :member,
+    :index,
+    :assign,
+    :str,
+    :num,
+    :bool,
+    :null,
+    :arr,
+    :obj,
+    :ph
+  ]
 
-  @runtime_expr_kinds MapSet.new([
-                        :state_ref,
-                        :runtime_ref,
-                        :bin_op,
-                        :unary_op,
-                        :ternary,
-                        :member,
-                        :index,
-                        :assign
-                      ])
+  @runtime_expr_kinds [
+    :state_ref,
+    :runtime_ref,
+    :bin_op,
+    :unary_op,
+    :ternary,
+    :member,
+    :index,
+    :assign
+  ]
 
   @spec is_ast_node?(term()) :: boolean()
-  def is_ast_node?(%{k: k}) when is_atom(k), do: MapSet.member?(@ast_kinds, k)
+  def is_ast_node?(%{k: k}) when k in @ast_kinds, do: true
   def is_ast_node?(_), do: false
 
   @spec is_runtime_expr?(term()) :: boolean()
-  def is_runtime_expr?(%{k: k}) when is_atom(k), do: MapSet.member?(@runtime_expr_kinds, k)
+  def is_runtime_expr?(%{k: k}) when k in @runtime_expr_kinds, do: true
   def is_runtime_expr?(_), do: false
 
   @spec is_element_node?(term()) :: boolean()
@@ -96,9 +96,11 @@ defmodule OpenUILang.AST do
   @spec collect_state_refs(term()) :: [String.t()]
   def collect_state_refs(node) do
     if is_ast_node?(node) do
-      collect_state_refs_rec(node, [])
-      |> Enum.reverse()
-      |> Enum.uniq()
+      case collect_state_refs_rec(node, []) do
+        [] -> []
+        [single] -> [single]
+        list -> list |> Enum.reverse() |> Enum.uniq()
+      end
     else
       []
     end
@@ -107,13 +109,92 @@ defmodule OpenUILang.AST do
   @spec collect_refs(term()) :: [String.t()]
   def collect_refs(node) do
     if is_ast_node?(node) do
-      collect_refs_rec(node, [])
-      |> Enum.reverse()
-      |> Enum.uniq()
+      case collect_refs_rec(node, []) do
+        [] -> []
+        [single] -> [single]
+        list -> list |> Enum.reverse() |> Enum.uniq()
+      end
     else
       []
     end
   end
+
+  @spec collect_refs_and_state_refs(term()) :: {[String.t()], [String.t()]}
+  def collect_refs_and_state_refs(node) do
+    if is_ast_node?(node) do
+      {refs, state_refs} = collect_both_rec(node, {[], []})
+
+      refs =
+        case refs do
+          [] -> []
+          [single] -> [single]
+          list -> list |> Enum.reverse() |> Enum.uniq()
+        end
+
+      state_refs =
+        case state_refs do
+          [] -> []
+          [single] -> [single]
+          list -> list |> Enum.reverse() |> Enum.uniq()
+        end
+
+      {refs, state_refs}
+    else
+      {[], []}
+    end
+  end
+
+  defp collect_both_rec(%{k: :state_ref, n: n}, {r, sr}), do: {r, [n | sr]}
+  defp collect_both_rec(%{k: k, n: n}, {r, sr}) when k in [:ref, :runtime_ref], do: {[n | r], sr}
+
+  defp collect_both_rec(%{k: :comp, args: args} = comp, acc) do
+    acc = Enum.reduce(args, acc, &collect_both_rec/2)
+
+    if mapped = Map.get(comp, :mapped_props) do
+      Enum.reduce(Map.values(mapped), acc, &collect_both_rec/2)
+    else
+      acc
+    end
+  end
+
+  defp collect_both_rec(%{k: :arr, els: els}, acc) do
+    Enum.reduce(els, acc, &collect_both_rec/2)
+  end
+
+  defp collect_both_rec(%{k: :obj, entries: entries}, acc) do
+    Enum.reduce(entries, acc, fn {_k, v}, a -> collect_both_rec(v, a) end)
+  end
+
+  defp collect_both_rec(%{k: :bin_op, left: l, right: r}, acc) do
+    acc = collect_both_rec(l, acc)
+    collect_both_rec(r, acc)
+  end
+
+  defp collect_both_rec(%{k: :unary_op, operand: op}, acc) do
+    collect_both_rec(op, acc)
+  end
+
+  defp collect_both_rec(%{k: :ternary, cond: c, then: t, else: e}, acc) do
+    acc
+    |> then(&collect_both_rec(c, &1))
+    |> then(&collect_both_rec(t, &1))
+    |> then(&collect_both_rec(e, &1))
+  end
+
+  defp collect_both_rec(%{k: :member, obj: obj}, acc) do
+    collect_both_rec(obj, acc)
+  end
+
+  defp collect_both_rec(%{k: :index, obj: obj, index: idx}, acc) do
+    acc = collect_both_rec(obj, acc)
+    collect_both_rec(idx, acc)
+  end
+
+  defp collect_both_rec(%{k: :assign, value: val}, acc) do
+    collect_both_rec(val, acc)
+  end
+
+  defp collect_both_rec(_, acc), do: acc
 
   defp collect_refs_rec(%{k: k, n: n}, acc) when k in [:ref, :runtime_ref], do: [n | acc]
 

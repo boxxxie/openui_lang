@@ -1,27 +1,29 @@
 defmodule OpenUILang.Lexer do
   @moduledoc false
 
-  @after_value_types MapSet.new([
-                       :num,
-                       :str,
-                       :ident,
-                       :type,
-                       :rparen,
-                       :rbrack,
-                       true,
-                       false,
-                       :null,
-                       :state_var,
-                       :builtin_call
-                     ])
+  @after_value_types [
+    :num,
+    :str,
+    :ident,
+    :type,
+    :rparen,
+    :rbrack,
+    true,
+    false,
+    :null,
+    :state_var,
+    :builtin_call
+  ]
 
-  @spec tokenize(String.t()) :: [map()]
+  @type token :: atom() | {atom(), term()}
+
+  @spec tokenize(String.t()) :: [token()]
   def tokenize(src) when is_binary(src) do
     do_tokenize(src, [])
   end
 
   defp do_tokenize(<<>>, acc) do
-    Enum.reverse([%{t: :eof} | acc])
+    Enum.reverse([:eof | acc])
   end
 
   # Skip horizontal whitespace (not newlines)
@@ -31,76 +33,77 @@ defmodule OpenUILang.Lexer do
 
   # Newline
   defp do_tokenize(<<"\n", rest::binary>>, acc) do
-    do_tokenize(rest, [%{t: :newline} | acc])
+    do_tokenize(rest, [:newline | acc])
   end
 
   # Single-character punctuation
-  defp do_tokenize(<<"(", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :lparen} | acc])
-  defp do_tokenize(<<")", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :rparen} | acc])
-  defp do_tokenize(<<"[", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :lbrack} | acc])
-  defp do_tokenize(<<"]", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :rbrack} | acc])
-  defp do_tokenize(<<"{", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :lbrace} | acc])
-  defp do_tokenize(<<"}", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :rbrace} | acc])
-  defp do_tokenize(<<",", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :comma} | acc])
-  defp do_tokenize(<<":", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :colon} | acc])
-  defp do_tokenize(<<".", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :dot} | acc])
-  defp do_tokenize(<<"?", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :question} | acc])
-  defp do_tokenize(<<"+", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :plus} | acc])
-  defp do_tokenize(<<"*", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :star} | acc])
-  defp do_tokenize(<<"/", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :slash} | acc])
-  defp do_tokenize(<<"%", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :percent} | acc])
+  defp do_tokenize(<<"(", rest::binary>>, acc), do: do_tokenize(rest, [:lparen | acc])
+  defp do_tokenize(<<")", rest::binary>>, acc), do: do_tokenize(rest, [:rparen | acc])
+  defp do_tokenize(<<"[", rest::binary>>, acc), do: do_tokenize(rest, [:lbrack | acc])
+  defp do_tokenize(<<"]", rest::binary>>, acc), do: do_tokenize(rest, [:rbrack | acc])
+  defp do_tokenize(<<"{", rest::binary>>, acc), do: do_tokenize(rest, [:lbrace | acc])
+  defp do_tokenize(<<"}", rest::binary>>, acc), do: do_tokenize(rest, [:rbrace | acc])
+  defp do_tokenize(<<",", rest::binary>>, acc), do: do_tokenize(rest, [:comma | acc])
+  defp do_tokenize(<<":", rest::binary>>, acc), do: do_tokenize(rest, [:colon | acc])
+  defp do_tokenize(<<".", rest::binary>>, acc), do: do_tokenize(rest, [:dot | acc])
+  defp do_tokenize(<<"?", rest::binary>>, acc), do: do_tokenize(rest, [:question | acc])
+  defp do_tokenize(<<"+", rest::binary>>, acc), do: do_tokenize(rest, [:plus | acc])
+  defp do_tokenize(<<"*", rest::binary>>, acc), do: do_tokenize(rest, [:star | acc])
+  defp do_tokenize(<<"/", rest::binary>>, acc), do: do_tokenize(rest, [:slash | acc])
+  defp do_tokenize(<<"%", rest::binary>>, acc), do: do_tokenize(rest, [:percent | acc])
 
   # Two-or-one character operators
-  defp do_tokenize(<<"==", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :eq_eq} | acc])
-  defp do_tokenize(<<"=", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :equals} | acc])
-  defp do_tokenize(<<"!=", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :not_eq} | acc])
-  defp do_tokenize(<<"!", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :not} | acc])
-  defp do_tokenize(<<">=", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :greater_eq} | acc])
-  defp do_tokenize(<<">", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :greater} | acc])
-  defp do_tokenize(<<"<=", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :less_eq} | acc])
-  defp do_tokenize(<<"<", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :less} | acc])
-  defp do_tokenize(<<"&&", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :and} | acc])
-  defp do_tokenize(<<"&", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :and} | acc])
-  defp do_tokenize(<<"||", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :or} | acc])
-  defp do_tokenize(<<"|", rest::binary>>, acc), do: do_tokenize(rest, [%{t: :or} | acc])
+  defp do_tokenize(<<"==", rest::binary>>, acc), do: do_tokenize(rest, [:eq_eq | acc])
+  defp do_tokenize(<<"=", rest::binary>>, acc), do: do_tokenize(rest, [:equals | acc])
+  defp do_tokenize(<<"!=", rest::binary>>, acc), do: do_tokenize(rest, [:not_eq | acc])
+  defp do_tokenize(<<"!", rest::binary>>, acc), do: do_tokenize(rest, [:not | acc])
+  defp do_tokenize(<<">=", rest::binary>>, acc), do: do_tokenize(rest, [:greater_eq | acc])
+  defp do_tokenize(<<">", rest::binary>>, acc), do: do_tokenize(rest, [:greater | acc])
+  defp do_tokenize(<<"<=", rest::binary>>, acc), do: do_tokenize(rest, [:less_eq | acc])
+  defp do_tokenize(<<"<", rest::binary>>, acc), do: do_tokenize(rest, [:less | acc])
+  defp do_tokenize(<<"&&", rest::binary>>, acc), do: do_tokenize(rest, [:and | acc])
+  defp do_tokenize(<<"&", rest::binary>>, acc), do: do_tokenize(rest, [:and | acc])
+  defp do_tokenize(<<"||", rest::binary>>, acc), do: do_tokenize(rest, [:or | acc])
+  defp do_tokenize(<<"|", rest::binary>>, acc), do: do_tokenize(rest, [:or | acc])
 
   # Double-quoted string literal
   defp do_tokenize(<<"\"", rest::binary>>, acc) do
     {str, remaining} = scan_double_quoted(rest, [])
-    do_tokenize(remaining, [%{t: :str, v: str} | acc])
+    do_tokenize(remaining, [{:str, str} | acc])
   end
 
   # Single-quoted string literal
   defp do_tokenize(<<"'", rest::binary>>, acc) do
     {str, remaining} = scan_single_quoted(rest, [])
-    do_tokenize(remaining, [%{t: :str, v: str} | acc])
+    do_tokenize(remaining, [{:str, str} | acc])
   end
 
   # Minus: negative number literal or subtraction operator
   defp do_tokenize(<<"-", next, _::binary>> = bin, acc) when next in ?0..?9 do
-    prev_t =
+    after_val? =
       case acc do
-        [%{t: t} | _] -> t
-        [] -> nil
+        [{t, _} | _] when t in @after_value_types -> true
+        [t | _] when t in @after_value_types -> true
+        _ -> false
       end
 
-    if prev_t != nil and MapSet.member?(@after_value_types, prev_t) do
+    if after_val? do
       <<_, rest::binary>> = bin
-      do_tokenize(rest, [%{t: :minus} | acc])
+      do_tokenize(rest, [:minus | acc])
     else
       {num, rest} = scan_number(bin)
-      do_tokenize(rest, [%{t: :num, v: num} | acc])
+      do_tokenize(rest, [{:num, num} | acc])
     end
   end
 
   defp do_tokenize(<<"-", rest::binary>>, acc) do
-    do_tokenize(rest, [%{t: :minus} | acc])
+    do_tokenize(rest, [:minus | acc])
   end
 
   # Positive number literal
   defp do_tokenize(<<c, _::binary>> = bin, acc) when c in ?0..?9 do
     {num, rest} = scan_number(bin)
-    do_tokenize(rest, [%{t: :num, v: num} | acc])
+    do_tokenize(rest, [{:num, num} | acc])
   end
 
   # State variable: $identifier
@@ -109,7 +112,7 @@ defmodule OpenUILang.Lexer do
     len = count_ident_bytes(rest, 2)
     ident = :binary.copy(binary_part(bin, 0, len))
     remaining = binary_part(bin, len, byte_size(bin) - len)
-    do_tokenize(remaining, [%{t: :state_var, v: ident} | acc])
+    do_tokenize(remaining, [{:state_var, ident} | acc])
   end
 
   # Builtin / function / action call: @identifier
@@ -118,7 +121,7 @@ defmodule OpenUILang.Lexer do
     len = count_ident_bytes(rest, 1)
     ident = :binary.copy(binary_part(bin, 1, len))
     remaining = binary_part(bin, len + 1, byte_size(bin) - len - 1)
-    do_tokenize(remaining, [%{t: :builtin_call, v: ident} | acc])
+    do_tokenize(remaining, [{:builtin_call, ident} | acc])
   end
 
   # Identifiers & keywords
@@ -130,11 +133,11 @@ defmodule OpenUILang.Lexer do
 
     tok =
       case word do
-        "true" -> %{t: true}
-        "false" -> %{t: false}
-        "null" -> %{t: :null}
-        _ when c in ?A..?Z -> %{t: :type, v: word}
-        _ -> %{t: :ident, v: word}
+        "true" -> true
+        "false" -> false
+        "null" -> :null
+        _ when c in ?A..?Z -> {:type, word}
+        _ -> {:ident, word}
       end
 
     do_tokenize(remaining, [tok | acc])
@@ -219,6 +222,18 @@ defmodule OpenUILang.Lexer do
   defp scan_double_fast(orig, <<"\\", _::binary>> = rest, len) do
     prefix = if len > 0, do: [binary_part(orig, 0, len)], else: []
     scan_double_quoted(rest, prefix)
+  end
+
+  defp scan_double_fast(
+         orig,
+         <<c1, c2, c3, c4, c5, c6, c7, c8, rest::binary>>,
+         len
+       )
+       when c1 != ?" and c1 != ?\\ and c2 != ?" and c2 != ?\\ and
+              c3 != ?" and c3 != ?\\ and c4 != ?" and c4 != ?\\ and
+              c5 != ?" and c5 != ?\\ and c6 != ?" and c6 != ?\\ and
+              c7 != ?" and c7 != ?\\ and c8 != ?" and c8 != ?\\ do
+    scan_double_fast(orig, rest, len + 8)
   end
 
   defp scan_double_fast(orig, <<_c, rest::binary>>, len) do
